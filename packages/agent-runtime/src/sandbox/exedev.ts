@@ -16,10 +16,10 @@ import {
 const profile = SANDBOX_PROVIDER_PROFILES.exedev;
 export const DEFAULT_EXEDEV_SANDBOX_IMAGE = "node:22-bookworm";
 const NAME_PREFIX = "gitterm-sbx-";
-const EXIT_MARKER = "__GITTERM_EXIT__";
 /** exe.dev's exec API accepts 64 KB request bodies; base64 chunks stay well below it. */
 const WRITE_CHUNK_BYTES = 40 * 1024;
 const READ_CHUNK_BYTES = 4 * 1024 * 1024;
+const PREVIEW_KEY_LIFETIME_MS = 60 * 60_000;
 
 type VmList = { vms?: Array<{ vm_name: string; status?: string }> };
 
@@ -37,14 +37,14 @@ export function createExeDevSandboxTransport(config: {
   disk?: string;
 }): SandboxTransport {
   if (!config.apiKey?.trim()) throw new SandboxProviderError("auth", "exe.dev token is empty.");
-  const accessKeys = new Map<string, string>();
+  const accessKeys = new Map<string, { token: string; expiresAt: number }>();
 
-  async function exec(command: string, action: string): Promise<string> {
+  async function exec(command: string, action: string, accept = "text/plain"): Promise<string> {
     let response: Response;
     try {
       response = await fetch("https://exe.dev/exec", {
         method: "POST",
-        headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "text/plain" },
+        headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "text/plain", accept },
         body: command,
         signal: AbortSignal.timeout(45_000),
       });
@@ -55,10 +55,15 @@ export function createExeDevSandboxTransport(config: {
     if (response.status === 401 || response.status === 403)
       throw new SandboxProviderError(
         "auth",
-        `exe.dev rejected the token while trying to ${action}. Tokens need cmds new, ls, ssh, ssh-key, pause, resume, and rm.`,
+        `exe.dev rejected the token while trying to ${action}. Sandbox tokens need cmds new, ls, ssh, pause, resume, and rm. Private previews also need the exact subcommand "ssh-key generate-api-key".`,
       );
     if (response.status === 504)
       throw new SandboxProviderError("timeout", `exe.dev timed out while trying to ${action}.`);
+    if (response.status === 422 && text.includes("Cannot create a new key that outlives"))
+      throw new SandboxProviderError(
+        "auth",
+        "exe.dev needs a sandbox token with at least one hour remaining to create a private preview key.",
+      );
     if (!response.ok)
       throw classifyFailure(
         "exe.dev",
@@ -109,15 +114,42 @@ export function createExeDevSandboxTransport(config: {
   }
 
   async function ssh(id: string, command: string, timeoutMs = 25_000) {
+    // The lobby lexes the request first, then the VM shell parses the resulting command.
+    // Pass one lobby argument containing the entire VM command, with its own shell quoting.
+    const remote = `timeout ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}`;
     const text = await exec(
-      `ssh ${id} -- bash -c ${shellQuote(`timeout ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}; printf '\\n${EXIT_MARKER}%s\\n' "$?"`)}`,
+      `ssh ${id} ${shellQuote(remote)}`,
       "run a command",
+      "application/x-ndjson",
     );
-    const match = new RegExp(`\\n?${EXIT_MARKER}(\\d+)\\n?$`).exec(text);
-    if (!match)
-      throw new SandboxProviderError("provider", "exe.dev did not report the command's exit code.");
-    // exe.dev returns stdout and stderr combined.
-    return { exitCode: Number(match[1]), stdout: text.slice(0, match.index), stderr: "" };
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    // fetch cannot read exe.dev's X-Exe-Exit trailer; NDJSON carries the exit status in-band.
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let frame: { stdout?: string; stderr?: string; exit_code?: number; error?: string } | null;
+      try {
+        frame = JSON.parse(line);
+      } catch {
+        throw new SandboxProviderError("provider", "exe.dev returned invalid command output.");
+      }
+      if (typeof frame?.error === "string")
+        throw new SandboxProviderError(
+          "provider",
+          `exe.dev could not run the command: ${frame.error}`,
+        );
+      if (typeof frame?.stdout === "string") stdout.push(Buffer.from(frame.stdout, "base64"));
+      if (typeof frame?.stderr === "string") stderr.push(Buffer.from(frame.stderr, "base64"));
+      const exitCode = frame?.exit_code;
+      if (typeof exitCode === "number" && Number.isInteger(exitCode)) {
+        return {
+          exitCode,
+          stdout: Buffer.concat(stdout).toString(),
+          stderr: Buffer.concat(stderr).toString(),
+        };
+      }
+    }
+    throw new SandboxProviderError("provider", "exe.dev did not report the command's exit code.");
   }
 
   async function running(id: string) {
@@ -169,6 +201,7 @@ export function createExeDevSandboxTransport(config: {
     },
 
     async destroy(id) {
+      accessKeys.delete(id);
       if ((await info(id)).state === "terminated") return;
       await exec(`rm ${id}`, "delete the sandbox");
     },
@@ -235,20 +268,24 @@ export function createExeDevSandboxTransport(config: {
       if (port < 3000 || port > 9999) throw new Error("exe.dev previews support ports 3000-9999");
       await running(id);
       let key = accessKeys.get(id);
-      if (!key) {
-        // A VM-scoped key kept only in this process's memory.
+      if (!key || key.expiresAt <= Date.now()) {
+        // exe.dev refuses a key that outlives its parent and rejects duplicate labels.
+        // Use a fresh label so another process can also open a preview of this VM.
+        const label = `gitterm-sandbox-${randomBytes(8).toString("hex")}`;
+        const expiresAt = Date.now() + PREVIEW_KEY_LIFETIME_MS;
         const output = await exec(
-          `ssh-key generate-api-key --vm=${id} --label=gitterm-sandbox --exp=never`,
+          `ssh-key generate-api-key --vm=${id} --label=${label} --exp=1h`,
           "create a preview key",
         );
-        key = output.match(/exe[01]\.[A-Za-z0-9._-]+/)?.[0];
-        if (!key)
+        const token = output.match(/exe[01]\.[A-Za-z0-9._-]+/)?.[0];
+        if (!token)
           throw new SandboxProviderError("provider", "exe.dev did not return a VM access key.");
+        key = { token, expiresAt };
         accessKeys.set(id, key);
       }
       return {
         url: `https://${id}.exe.xyz:${port}/`,
-        headers: { "X-Exedev-Authorization": `Bearer ${key}` },
+        headers: { "X-Exedev-Authorization": `Bearer ${key.token}` },
       };
     },
   };

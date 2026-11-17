@@ -49,6 +49,11 @@ Restart OpenCode after changing the settings.
 Railway and exe.dev never delete a forgotten sandbox themselves, so they need
 `allowUnboundedLifetime: true`. Destroy sandboxes you no longer need.
 
+For exe.dev, the token needs `new`, `ls`, `ssh`, `pause`, `resume`, and `rm`.
+Private previews also need `ssh-key generate-api-key` (the full subcommand, not
+just `ssh-key`) and at least one hour left on the sandbox token. Preview access
+lasts up to one hour; run `sandbox_preview` again to renew it.
+
 ### Or use GitTerm
 
 Leave out `apiKey` and sandboxes go through GitTerm instead, billed to your plan. No provider
