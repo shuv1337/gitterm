@@ -49,6 +49,7 @@ function cookies(header: string | undefined): Map<string, string> {
 export async function startPreviewProxy(
   access: SandboxPreviewAccess & { refresh?: () => Promise<SandboxPreviewAccess> },
 ): Promise<PreviewProxy> {
+  // Refresh credentials only; keep the original upstream URL.
   const upstream = new URL(access.url);
   const token = randomBytes(24).toString("hex");
   const hostname = `p-${randomBytes(8).toString("hex")}.localhost`;

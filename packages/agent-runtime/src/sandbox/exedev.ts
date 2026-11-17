@@ -146,7 +146,7 @@ export function createExeDevSandboxTransport(config: {
   async function ssh(id: string, command: string, timeoutMs = 25_000) {
     // The lobby lexes the request first, then the VM shell parses the resulting command.
     // Pass one lobby argument containing the entire VM command, with its own shell quoting.
-    const remote = `timeout -k 3 ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}; exit "$?"`;
+    const remote = `timeout -k 3 ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}`;
     const text = await exec(
       `ssh ${id} ${shellQuote(remote)}`,
       "run a command",
