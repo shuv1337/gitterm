@@ -35,7 +35,12 @@ export type SandboxCapabilities = {
 
 export type SandboxCommandResult = { exitCode: number; stdout: string; stderr: string };
 
-export type SandboxPreviewAccess = { url: string; headers: Record<string, string> };
+export type SandboxPreviewAccess = {
+  url: string;
+  headers: Record<string, string>;
+  /** When the provider credentials expire, as a Unix timestamp in milliseconds. */
+  expiresAt?: number;
+};
 
 export type SandboxFailureCode = "auth" | "not_found" | "rate_limited" | "timeout" | "provider";
 

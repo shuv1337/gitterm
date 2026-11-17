@@ -2,6 +2,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
+import { SANDBOX_PREVIEW_RENEWAL_MS } from "@gitterm/agent-runtime/sandbox/types";
+import type { SandboxPreviewAccess } from "./types.js";
 
 /**
  * A loopback-only proxy for a private preview. Local tools (for example browser
@@ -44,18 +46,45 @@ function cookies(header: string | undefined): Map<string, string> {
   return result;
 }
 
-export async function startPreviewProxy(access: {
-  url: string;
-  headers: Record<string, string>;
-}): Promise<PreviewProxy> {
+export async function startPreviewProxy(
+  access: SandboxPreviewAccess & { refresh?: () => Promise<SandboxPreviewAccess> },
+): Promise<PreviewProxy> {
   const upstream = new URL(access.url);
   const token = randomBytes(24).toString("hex");
   const hostname = `p-${randomBytes(8).toString("hex")}.localhost`;
   // Untrusted input: check the format before a constant-time comparison of equal lengths.
   const matches = (value: string | null | undefined) =>
     !!value && TOKEN_FORMAT.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(token));
-  // Provider access cookies (e.g. Boat's `_port_auth`) are merged with the app's own.
-  const { cookie: accessCookie, ...accessHeaders } = access.headers;
+  let credential: SandboxPreviewAccess = access;
+  let refreshing: Promise<void> | undefined;
+  let retryAt = 0;
+
+  async function previewHeaders() {
+    const now = Date.now();
+    const { expiresAt } = credential;
+    if (
+      access.refresh &&
+      expiresAt !== undefined &&
+      expiresAt - now <= SANDBOX_PREVIEW_RENEWAL_MS
+    ) {
+      if (now >= retryAt)
+        refreshing ??= access
+          .refresh()
+          .then((next) => {
+            credential = next;
+          })
+          .catch(() => {
+            // The old key can still serve requests until expiry. Don't hammer the provider
+            // with a refresh attempt on every asset when the sandbox or parent token is unavailable.
+            retryAt = Date.now() + 30_000;
+          })
+          .finally(() => (refreshing = undefined));
+      await refreshing;
+    }
+    if (credential.expiresAt !== undefined && credential.expiresAt <= Date.now())
+      throw new Error("Preview credentials expired");
+    return credential.headers;
+  }
   let expectedHost = "";
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
@@ -94,6 +123,8 @@ export async function startPreviewProxy(access: {
       if (value === undefined || HOP_BY_HOP.has(key.toLowerCase())) continue;
       headers.set(key, Array.isArray(value) ? value.join(", ") : value);
     }
+    // Provider access cookies (e.g. Boat's `_port_auth`) are merged with the app's own.
+    const { cookie: accessCookie, ...accessHeaders } = await previewHeaders();
     for (const [key, value] of Object.entries(accessHeaders)) headers.set(key, value);
     const forwarded = [...[...jar].map(([name, value]) => `${name}=${value}`), accessCookie].filter(
       Boolean,

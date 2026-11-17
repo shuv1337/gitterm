@@ -3,6 +3,7 @@ import {
   accountHash,
   classifyFailure,
   discardFailedCreate,
+  SANDBOX_PREVIEW_RENEWAL_MS,
   SANDBOX_PROVIDER_PROFILES,
   SandboxProviderError,
   shellQuote,
@@ -19,7 +20,6 @@ const NAME_PREFIX = "gitterm-sbx-";
 /** exe.dev's exec API accepts 64 KB request bodies; base64 chunks stay well below it. */
 const WRITE_CHUNK_BYTES = 40 * 1024;
 const READ_CHUNK_BYTES = 4 * 1024 * 1024;
-const PREVIEW_KEY_LIFETIME_MS = 60 * 60_000;
 
 type VmList = { vms?: Array<{ vm_name: string; status?: string }> };
 
@@ -37,40 +37,70 @@ export function createExeDevSandboxTransport(config: {
   disk?: string;
 }): SandboxTransport {
   if (!config.apiKey?.trim()) throw new SandboxProviderError("auth", "exe.dev token is empty.");
-  const accessKeys = new Map<string, { token: string; expiresAt: number }>();
+  const accessKeys = new Map<string, { token: string; expiresAt?: number }>();
 
-  async function exec(command: string, action: string, accept = "text/plain"): Promise<string> {
-    let response: Response;
+  async function request(command: string, action: string, accept = "text/plain") {
     try {
-      response = await fetch("https://exe.dev/exec", {
+      const response = await fetch("https://exe.dev/exec", {
         method: "POST",
         headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "text/plain", accept },
         body: command,
         signal: AbortSignal.timeout(45_000),
       });
+      return { status: response.status, ok: response.ok, text: await response.text() };
     } catch (error) {
       throw classifyFailure("exe.dev", error, action);
     }
-    const text = await response.text();
-    if (response.status === 401 || response.status === 403)
+  }
+
+  function checked({ status, ok, text }: Awaited<ReturnType<typeof request>>, action: string) {
+    if (status === 401 || status === 403)
       throw new SandboxProviderError(
         "auth",
         `exe.dev rejected the token while trying to ${action}. Sandbox tokens need cmds new, ls, ssh, pause, resume, and rm. Private previews also need the exact subcommand "ssh-key generate-api-key".`,
       );
-    if (response.status === 504)
+    if (status === 504)
       throw new SandboxProviderError("timeout", `exe.dev timed out while trying to ${action}.`);
-    if (response.status === 422 && text.includes("Cannot create a new key that outlives"))
-      throw new SandboxProviderError(
-        "auth",
-        "exe.dev needs a sandbox token with at least one hour remaining to create a private preview key.",
-      );
-    if (!response.ok)
-      throw classifyFailure(
-        "exe.dev",
-        new Error(`${response.status} ${text.slice(0, 200)}`),
-        action,
-      );
+    if (!ok) throw classifyFailure("exe.dev", new Error(`${status} ${text.slice(0, 200)}`), action);
     return text;
+  }
+
+  async function exec(command: string, action: string, accept?: string): Promise<string> {
+    return checked(await request(command, action, accept), action);
+  }
+
+  async function mintPreviewKey(id: string) {
+    const action = "create a preview key";
+    // Labels must be unique even across processes. Keep the old long-lived behavior if allowed.
+    const label = `gitterm-sandbox-${randomBytes(8).toString("hex")}`;
+    const command = `ssh-key generate-api-key --vm=${id} --label=${label}`;
+    const outlivesParent = ({ status, text }: Awaited<ReturnType<typeof request>>) =>
+      status === 422 && text.includes("Cannot create a new key that outlives");
+    let result = await request(`${command} --exp=never`, action);
+    const shortLived = outlivesParent(result);
+    if (shortLived) {
+      result = await request(`${command} --exp=1h`, action);
+      if (outlivesParent(result))
+        throw new SandboxProviderError(
+          "auth",
+          "exe.dev needs a sandbox token with at least one hour remaining to create a private preview key.",
+        );
+    }
+    const text = checked(result, action);
+    let token: string | undefined;
+    let expiresAt: number | undefined;
+    try {
+      const data = JSON.parse(text) as { token?: string; expires_at?: string } | null;
+      token = data?.token;
+      if (shortLived) expiresAt = Date.parse(data?.expires_at ?? "");
+    } catch {
+      // Don't include a response that might contain a credential in an error.
+    }
+    if (typeof token !== "string" || !token)
+      throw new SandboxProviderError("provider", "exe.dev did not return a VM access key.");
+    if (shortLived && !Number.isFinite(expiresAt))
+      throw new SandboxProviderError("provider", "exe.dev did not report the preview key expiry.");
+    return { token, expiresAt };
   }
 
   const parseList = (text: string): VmList => {
@@ -116,7 +146,7 @@ export function createExeDevSandboxTransport(config: {
   async function ssh(id: string, command: string, timeoutMs = 25_000) {
     // The lobby lexes the request first, then the VM shell parses the resulting command.
     // Pass one lobby argument containing the entire VM command, with its own shell quoting.
-    const remote = `timeout ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}`;
+    const remote = `timeout -k 3 ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}; exit "$?"`;
     const text = await exec(
       `ssh ${id} ${shellQuote(remote)}`,
       "run a command",
@@ -268,24 +298,17 @@ export function createExeDevSandboxTransport(config: {
       if (port < 3000 || port > 9999) throw new Error("exe.dev previews support ports 3000-9999");
       await running(id);
       let key = accessKeys.get(id);
-      if (!key || key.expiresAt <= Date.now()) {
-        // exe.dev refuses a key that outlives its parent and rejects duplicate labels.
-        // Use a fresh label so another process can also open a preview of this VM.
-        const label = `gitterm-sandbox-${randomBytes(8).toString("hex")}`;
-        const expiresAt = Date.now() + PREVIEW_KEY_LIFETIME_MS;
-        const output = await exec(
-          `ssh-key generate-api-key --vm=${id} --label=${label} --exp=1h`,
-          "create a preview key",
-        );
-        const token = output.match(/exe[01]\.[A-Za-z0-9._-]+/)?.[0];
-        if (!token)
-          throw new SandboxProviderError("provider", "exe.dev did not return a VM access key.");
-        key = { token, expiresAt };
+      if (
+        !key ||
+        (key.expiresAt !== undefined && key.expiresAt - Date.now() <= SANDBOX_PREVIEW_RENEWAL_MS)
+      ) {
+        key = await mintPreviewKey(id);
         accessKeys.set(id, key);
       }
       return {
         url: `https://${id}.exe.xyz:${port}/`,
         headers: { "X-Exedev-Authorization": `Bearer ${key.token}` },
+        ...(key.expiresAt === undefined ? {} : { expiresAt: key.expiresAt }),
       };
     },
   };

@@ -77,7 +77,11 @@ export type SandboxPreviewAccess = {
   url: string;
   /** Required by private previews; sandbox-scoped bearer values. Never show them to a model. */
   headers: Record<string, string>;
+  /** When the provider credentials expire, as a Unix timestamp in milliseconds. */
+  expiresAt?: number;
 };
+
+export const SANDBOX_PREVIEW_RENEWAL_MS = 15 * 60_000;
 
 export type SandboxCapabilities = {
   /**

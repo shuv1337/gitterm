@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -203,6 +203,47 @@ describe("review regressions", () => {
     } finally {
       await proxy.close();
       upstream.close();
+    }
+  });
+
+  test("a loopback preview renews credentials without changing its URL or cookie", async () => {
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => new Response(request.headers.get("x-access")),
+    });
+    const now = Date.now();
+    let time = now;
+    let refreshes = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => time);
+    const proxy = await startPreviewProxy({
+      url: upstream.url.href,
+      headers: { "x-access": "original" },
+      expiresAt: now + 60 * 60_000,
+      async refresh() {
+        refreshes++;
+        return {
+          url: upstream.url.href,
+          headers: { "x-access": "renewed" },
+          expiresAt: time + 60 * 60_000,
+        };
+      },
+    });
+    try {
+      const opened = await browserFetch(proxy.url, { redirect: "manual" });
+      const cookie = opened.headers.getSetCookie()[0]!.split(";")[0]!;
+      const url = new URL("/", proxy.url);
+      const get = () => browserFetch(url, { headers: { cookie } }).then((r) => r.text());
+      time += 45 * 60_000 - 1;
+      expect(await get()).toBe("original");
+      expect(refreshes).toBe(0);
+      time++;
+      expect(await Promise.all([get(), get()])).toEqual(["renewed", "renewed"]);
+      expect(refreshes).toBe(1);
+    } finally {
+      clock.mockRestore();
+      await proxy.close();
+      upstream.stop(true);
     }
   });
 

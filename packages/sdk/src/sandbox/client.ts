@@ -32,6 +32,7 @@ import {
   type SandboxRecord,
   type SandboxStore,
 } from "./store.js";
+import type { SandboxPreviewAccess } from "./types.js";
 
 export type SandboxLimits = {
   /** Live sandboxes per account. */
@@ -94,7 +95,7 @@ export type PreviewResult = {
   /** `url` is served by Gitterm; when private, it opens for the owner signed in to Gitterm. */
   viaGitterm: boolean;
   /** Direct provider access, for local proxies. The headers are secret: keep them away from models, logs, and storage. */
-  access: { url: string; headers: Record<string, string> };
+  access: SandboxPreviewAccess & { refresh?: () => Promise<SandboxPreviewAccess> };
   ready: boolean;
   /** HTTP status of `url` without credentials (401/403 means access is enforced). */
   unauthenticatedStatus: number | null;
@@ -551,7 +552,14 @@ export function createSandboxClient(options: {
         port: input.port,
         public: wantPublic,
         viaGitterm: Boolean(gittermUrl),
-        access,
+        access: {
+          ...access,
+          // Refresh credentials only: do not restart the server, resume the VM, or
+          // change route permissions as a side effect of a browser request.
+          ...(identity.mode === "direct" && access.expiresAt !== undefined
+            ? { refresh: () => backend.preview(ref.id, input.port) }
+            : {}),
+        },
         ready,
         unauthenticatedStatus,
         jobId,
