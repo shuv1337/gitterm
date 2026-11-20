@@ -18,6 +18,7 @@ This page lists what leaves your machine when your local agent uses a Gitterm sa
 - Model credentials. No coding agent runs in the sandbox.
 - Your provider key or Gitterm token.
 - Untracked files that Git ignores, such as `node_modules` or build output.
+- Submodule contents.
 - Secret-like files. `sandbox_sync` leaves these out and lists them in the approval prompt:
   - `.env` and `.env.*`, except `.env.example`, `.env.sample`, and `.env.template`
   - `.npmrc`, `.netrc`, `.pypirc`
