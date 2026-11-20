@@ -134,7 +134,8 @@ export BOAT_API_KEY=...
 
 # exe.dev
 export EXEDEV_API_TOKEN=...
-# Token cmds must include new, ls, ssh, share, ssh-key, pause, resume, and rm.
+# Token cmds must include new, ls, ssh, share, "ssh-key generate-api-key", pause, resume, and rm.
+# The workspace smoke test uses a non-expiring token: workspace access requests --exp=never.
 
 # Railway
 export RAILWAY_API_TOKEN=...
@@ -158,6 +159,8 @@ export GITTERM_E2E_RUN_TIMEOUT_MS=1800000
 ```
 
 Provider image overrides are available through `DAYTONA_IMAGE`, `EXEDEV_IMAGE`, and `RAILWAY_IMAGE`. To test unpublished Railway entrypoint changes, build and push a temporary public image and set `RAILWAY_IMAGE` to that tag.
+
+The exe.dev agent sandbox uses the same `ssh-key generate-api-key` permission for previews, but can also use an expiring token with at least an hour left. The direct OpenCode loopback proxy renews the one-hour VM key on use with 15 minutes or less left. Gitterm-hosted preview routes need another `sandbox_preview` call to update their key.
 
 Each provider test creates a persistent workspace, verifies repository cloning and synchronous setup, round-trips the serialized workspace handle, checks runtime status, runs OpenCode and reads its messages, exercises keep-alive and pause/resume when supported, then terminates and verifies termination. Providers run sequentially to limit cost. Cleanup runs in `finally`, and the summary prints the workspace ID and any cleanup failure so leaked resources can be found.
 
