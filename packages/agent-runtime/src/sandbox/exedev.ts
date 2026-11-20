@@ -684,6 +684,7 @@ export function createExeDevSandboxTransport(
               Math.min(4_000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2),
               deadline,
             );
+            deadline.throwIfAborted();
           }
         }
         if (check.exitCode !== 0) throw new Error("VM did not run a command");

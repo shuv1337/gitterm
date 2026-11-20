@@ -996,23 +996,29 @@ function mockCreate(
   return { ops, name: () => name };
 }
 
-test("creation backs off while SSH is unreachable and keeps the VM once ready", async () => {
-  const clock = fakeClock();
-  const start = clock.now();
-  const probes: number[] = [];
-  randomSpy = spyOn(Math, "random").mockReturnValue(1);
-  const { ops, name } = mockCreate((op) => {
-    if (op !== "ssh") return;
-    probes.push(clock.now() - start);
-    return probes.length <= 4 ? unreachable() : ndjson({ exit_code: 0 });
-  });
-  expect(await clock.run(upload(clock).create(createInput))).toMatchObject({
-    id: name(),
-    state: "running",
-  });
-  expect(probes).toEqual([0, 500, 1500, 3500, 7500]);
-  expect(ops).toEqual(["new", "ls", "ssh", "ssh", "ssh", "ssh", "ssh", "ls"]);
-});
+test.each([
+  [0, [0, 250, 750, 1750, 3750]],
+  [1, [0, 500, 1500, 3500, 7500]],
+] satisfies [number, number[]][])(
+  "creation backs off while SSH is unreachable and keeps the VM once ready (random %s)",
+  async (random, offsets) => {
+    const clock = fakeClock();
+    const start = clock.now();
+    const probes: number[] = [];
+    randomSpy = spyOn(Math, "random").mockReturnValue(random);
+    const { ops, name } = mockCreate((op) => {
+      if (op !== "ssh") return;
+      probes.push(clock.now() - start);
+      return probes.length <= 4 ? unreachable() : ndjson({ exit_code: 0 });
+    });
+    expect(await clock.run(upload(clock).create(createInput))).toMatchObject({
+      id: name(),
+      state: "running",
+    });
+    expect(probes).toEqual(offsets);
+    expect(ops).toEqual(["new", "ls", "ssh", "ssh", "ssh", "ssh", "ssh", "ls"]);
+  },
+);
 
 test.each([
   [
