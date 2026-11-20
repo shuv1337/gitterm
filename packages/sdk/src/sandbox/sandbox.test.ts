@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -115,7 +115,7 @@ const { SandboxAccountError } = backendModule;
 const { accountHash } = await import("@gitterm/agent-runtime/sandbox/types");
 const { SandboxProviderError } = await import("@gitterm/agent-runtime/sandbox/types");
 const { createFileSandboxStore } = await import("./store");
-const { captureSource, globToRegExp } = await import("./source");
+const { captureSource, globToRegExp, sourceLimitBytes } = await import("./source");
 const { createTarGz } = await import("./tar");
 
 const settings = {
@@ -226,8 +226,13 @@ describe("sandbox account isolation", () => {
       });
       expect(JSON.stringify(describeSandboxAccount(account))).not.toContain("key-team-1");
       // One account inline, named after its provider.
-      const inline = await resolveSandboxAccount({ provider: "e2b", apiKey: "key-team-1" });
+      const inline = await resolveSandboxAccount({
+        provider: "e2b",
+        apiKey: "key-team-1",
+        maxSourceMiB: 512,
+      });
       expect(inline).toMatchObject({ name: "e2b", provider: "e2b", ownKey: true });
+      expect(inline.config).not.toHaveProperty("maxSourceMiB");
     } finally {
       process.env.GITTERM_API_TOKEN = saved.token;
       process.env.HOME = saved.home;
@@ -679,6 +684,31 @@ describe("preview visibility", () => {
 });
 
 describe("source snapshots", () => {
+  test("sync limit defaults to 100 MiB and accepts only whole MiB from 1 to 1024", () => {
+    expect(sourceLimitBytes()).toBe(104857600);
+    expect(sourceLimitBytes(512)).toBe(536870912);
+    expect(sourceLimitBytes(1)).toBe(1024 * 1024);
+    expect(sourceLimitBytes(1024)).toBe(1024 * 1024 * 1024);
+    for (const invalid of [0, -1, 1.5, NaN, Infinity, 1025, "512", null])
+      expect(() => sourceLimitBytes(invalid as number)).toThrow(/maxSourceMiB/);
+  });
+
+  test("a checkout over the limit is refused until the user raises it", async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), "gitterm-src-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "pipe" });
+      const file = path.join(repo, "large.dat");
+      const bytes = 101 * 1024 * 1024;
+      await writeFile(file, "");
+      await truncate(file, bytes);
+      await expect(captureSource(repo)).rejects.toThrow(/100 MiB sandbox sync limit.*maxSourceMiB/);
+      const { snapshot } = await captureSource(repo, { maxBytes: sourceLimitBytes(512) });
+      expect(snapshot.bytes).toBe(bytes);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   test("glob exclusions", () => {
     expect(globToRegExp("*.log").test("a/b/build.log")).toBe(true);
     expect(globToRegExp("fixtures/**").test("fixtures/x/y")).toBe(true);

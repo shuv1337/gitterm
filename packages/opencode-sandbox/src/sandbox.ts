@@ -9,6 +9,7 @@ import {
   describeSandboxAccount,
   projectDir,
   resolveSandboxAccount,
+  sourceLimitBytes,
   startPreviewProxy,
   type JobView,
   type PreviewProxy,
@@ -564,6 +565,7 @@ export async function registerSandboxTools(
         await current.get(ref);
         const captured = await captureSource(await sessionDirectory(context), {
           exclude: settings?.exclude,
+          maxBytes: sourceLimitBytes(settings?.maxSourceMiB),
         });
         const { snapshot } = captured;
         await assert(

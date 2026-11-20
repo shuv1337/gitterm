@@ -15,6 +15,16 @@ import { createTarGz, type TarEntry } from "./tar.js";
 export const projectDir = (home: string) => `${home}/project`;
 const stateDir = (home: string) => `${home}/.gitterm/source`;
 export const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
+export const MAX_SOURCE_LIMIT_MIB = 1024;
+
+export function sourceLimitBytes(maxSourceMiB?: number): number {
+  if (maxSourceMiB === undefined) return MAX_SOURCE_BYTES;
+  if (!Number.isInteger(maxSourceMiB) || maxSourceMiB < 1 || maxSourceMiB > MAX_SOURCE_LIMIT_MIB)
+    throw new Error(
+      `"maxSourceMiB" must be a whole number of MiB from 1 to ${MAX_SOURCE_LIMIT_MIB}, not ${JSON.stringify(maxSourceMiB)}.`,
+    );
+  return maxSourceMiB * 1024 * 1024;
+}
 
 export type SnapshotFile = {
   path: string;
@@ -181,7 +191,7 @@ export async function captureSource(
     bytes += info.size;
     if (bytes > maxBytes)
       throw new Error(
-        `Source exceeds the ${Math.round(maxBytes / 1024 / 1024)} MiB sandbox sync limit. Exclude build output or large files.`,
+        `Source exceeds the ${Math.round(maxBytes / 1024 / 1024)} MiB sandbox sync limit. Exclude build output or large files. Only the user can raise the limit, with "maxSourceMiB" in the sandbox settings.`,
       );
     // Hash and archive the same bytes so the manifest describes exactly what is uploaded.
     const data = await readFile(full);
