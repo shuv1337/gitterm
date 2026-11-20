@@ -958,6 +958,187 @@ test("creation reports the VM wait deadline and deletes the unfinished VM", asyn
   expect(removed).toBe(true);
 });
 
+const unreachable = (status = 422) =>
+  Response.json(
+    {
+      code: "vm_unreachable",
+      error: "failed to connect to VM: SSH new client conn failed: ssh: handshake failed: EOF\n",
+    },
+    { status },
+  );
+const createInput = { timeoutMs: 60_000, labels: {} };
+const createTimeout = { code: "timeout", message: "Timed out waiting for the exe.dev VM." };
+const commandFailure = { code: "provider", message: "exe.dev failed to run a command." };
+
+function mockCreate(
+  handle: (op: string, signal?: AbortSignal) => Response | Promise<Response> | undefined,
+) {
+  let name: string | undefined;
+  const ops: string[] = [];
+  fetchSpy = mockExec((command, _headers, signal) => {
+    const op = command.split(" ", 1)[0]!;
+    ops.push(op);
+    if (op === "new") {
+      name = /--name=([a-z0-9-]+)/.exec(command)?.[1];
+      expect(name).toBeDefined();
+    } else if (op === "ls") {
+      expect(command).toBe(`ls ${name} --json`);
+    } else if (op === "ssh") {
+      expect(command).toBe(`ssh ${name} 'timeout -k 3 25 bash -c '"'"'true'"'"''`);
+    } else {
+      expect(command).toBe(`rm ${name}`);
+    }
+    return (
+      handle(op, signal) ??
+      Response.json(op === "ls" ? { vms: [{ vm_name: name, status: "running" }] } : {})
+    );
+  });
+  return { ops, name: () => name };
+}
+
+test("creation backs off while SSH is unreachable and keeps the VM once ready", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const probes: number[] = [];
+  randomSpy = spyOn(Math, "random").mockReturnValue(1);
+  const { ops, name } = mockCreate((op) => {
+    if (op !== "ssh") return;
+    probes.push(clock.now() - start);
+    return probes.length <= 4 ? unreachable() : ndjson({ exit_code: 0 });
+  });
+  expect(await clock.run(upload(clock).create(createInput))).toMatchObject({
+    id: name(),
+    state: "running",
+  });
+  expect(probes).toEqual([0, 500, 1500, 3500, 7500]);
+  expect(ops).toEqual(["new", "ls", "ssh", "ssh", "ssh", "ssh", "ssh", "ls"]);
+});
+
+test.each([
+  [
+    "403",
+    () => unreachable(403),
+    { code: "auth", message: expect.stringContaining("while trying to run a command.") },
+  ],
+  ["unrelated 422", () => Response.json({ code: "other" }, { status: 422 }), commandFailure],
+  ["plain text 422", () => new Response("vm_unreachable", { status: 422 }), commandFailure],
+  ["numeric code 422", () => Response.json({ code: 123 }, { status: 422 }), commandFailure],
+  ["503", () => unreachable(503), commandFailure],
+  [
+    "504",
+    () => new Response(null, { status: 504 }),
+    { code: "timeout", message: "exe.dev timed out while trying to run a command." },
+  ],
+  [
+    "fetch throw",
+    () => {
+      throw new Error("connection closed");
+    },
+    commandFailure,
+  ],
+  [
+    "NDJSON error",
+    () => ndjson({ error: "x" }),
+    { code: "provider", message: "exe.dev could not run the command: x" },
+  ],
+  [
+    "missing exit",
+    () => ndjson({ stdout: "aGk=" }),
+    { code: "provider", message: "exe.dev did not report the command's exit code." },
+  ],
+  ["nonzero exit", () => ndjson({ exit_code: 1 }), { message: "VM did not run a command" }],
+] as const)("creation does not retry a readiness probe after %s", async (_case, reply, failure) => {
+  const clock = fakeClock();
+  let probes = 0;
+  randomSpy = spyOn(Math, "random").mockReturnValue(1);
+  const { ops } = mockCreate((op) => {
+    if (op === "ssh") return ++probes === 1 ? reply() : ndjson({ exit_code: 0 });
+  });
+  await expect(clock.run(upload(clock).create(createInput))).rejects.toMatchObject(failure);
+  expect(ops).toEqual(["new", "ls", "ssh", "rm"]);
+});
+
+test.each([
+  ["new", "create a sandbox", ["new"]],
+  ["ls", "read the sandbox", ["new", "ls", "rm"]],
+] as const)("creation does not retry vm_unreachable from %s", async (failed, action, expected) => {
+  const clock = fakeClock();
+  const { ops } = mockCreate((op) => {
+    if (op === failed) return unreachable();
+  });
+  await expect(clock.run(upload(clock).create(createInput))).rejects.toMatchObject({
+    code: "provider",
+    message: `exe.dev failed to ${action}.`,
+  });
+  expect(ops).toEqual([...expected]);
+});
+
+test("run does not retry vm_unreachable", async () => {
+  const clock = fakeClock();
+  let probes = 0;
+  fetchSpy = mockExec((command) => {
+    expect(command).toStartWith(`ssh ${id} `);
+    return ++probes === 1 ? unreachable() : ndjson({ exit_code: 0 });
+  });
+  await expect(clock.run(upload(clock).run(id, "true"))).rejects.toMatchObject(commandFailure);
+  expect(probes).toBe(1);
+});
+
+test("creation stops probing and deletes the VM at the shared deadline", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const probes: number[] = [];
+  const removals: number[] = [];
+  randomSpy = spyOn(Math, "random").mockReturnValue(1);
+  const { ops } = mockCreate((op) => {
+    if (op === "rm") removals.push(clock.now() - start);
+    if (op !== "ssh") return;
+    probes.push(clock.now() - start);
+    if (probes.length > 200) throw new Error("SSH probes outlived the create deadline");
+    return unreachable();
+  });
+  await expect(clock.run(upload(clock).create(createInput))).rejects.toMatchObject(createTimeout);
+  expect(probes).toHaveLength(33);
+  expect(probes.every((offset) => offset < 120_000)).toBe(true);
+  expect(removals).toEqual([120_000]);
+  expect(ops.at(-1)).toBe("rm");
+});
+
+test.each([200, 500])("create deadline aborts an in-flight probe (rm %s)", async (status) => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const probes: number[] = [];
+  let polls = 0;
+  let abortedAt: number | undefined;
+  randomSpy = spyOn(Math, "random").mockReturnValue(1);
+  const { ops, name } = mockCreate((op, signal) => {
+    // Start the probes late enough for the create deadline to beat the per-request timeout.
+    if (op === "ls" && ++polls <= 2)
+      return new Response(null, { status: 429, headers: { "retry-after": "40" } });
+    if (op === "rm") return new Response(null, { status });
+    if (op !== "ssh") return;
+    probes.push(clock.now() - start);
+    if (probes.length === 1) return unreachable();
+    if (probes.length > 2) return ndjson({ exit_code: 0 });
+    return new Promise((_, reject) => {
+      signal!.addEventListener(
+        "abort",
+        () => {
+          abortedAt = clock.now() - start;
+          reject(signal!.reason);
+        },
+        { once: true },
+      );
+    });
+  });
+  const result = clock.run(upload(clock).create(createInput));
+  await expect(result).rejects.toMatchObject(createTimeout);
+  await expect(result).rejects.toHaveProperty("leftoverId", status === 500 ? name() : undefined);
+  expect(probes).toEqual([80_250, 80_750]);
+  expect(abortedAt).toBe(120_000);
+  expect(ops).toEqual(["new", "ls", "ls", "ls", "ssh", "ssh", "rm"]);
+});
+
 test("a detached poll waits out a 429 and collects the result", async () => {
   const clock = fakeClock();
   let polls = 0;

@@ -44,6 +44,8 @@ class ExecFailure extends SandboxProviderError {
     code: SandboxFailureCode,
     message: string,
     readonly retryable: boolean,
+    readonly status?: number,
+    readonly providerCode?: string,
   ) {
     super(code, message);
   }
@@ -66,6 +68,15 @@ function parseRetryAfter(value: string | null, now: number) {
   const header = value?.trim() ?? "";
   const ms = /^\d+$/.test(header) ? Number(header) * 1_000 : Date.parse(header) - now;
   return Number.isFinite(ms) ? Math.min(60_000, Math.max(0, ms)) : undefined;
+}
+
+function parseProviderCode(text: string) {
+  try {
+    const data = JSON.parse(text) as { code?: unknown } | null;
+    return typeof data?.code === "string" ? data.code : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function checkUpload(result: { exitCode: number; stderr: string }) {
@@ -210,6 +221,19 @@ export function createExeDevSandboxTransport(
   const accessKeys = new Map<string, { token: string; expiresAt?: number }>();
   const limiter = execLimiter(clock);
 
+  function pauseBeforeProbe(ms: number, signal: AbortSignal) {
+    return new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      const wake = () => {
+        cancel();
+        signal.removeEventListener("abort", wake);
+        resolve();
+      };
+      const cancel = clock.timer(ms, wake);
+      signal.addEventListener("abort", wake, { once: true });
+    });
+  }
+
   async function request(
     command: string,
     action: string,
@@ -280,7 +304,13 @@ export function createExeDevSandboxTransport(
               Object.assign(new Error(`${status} ${text.slice(0, 200)}`), { status }),
               action,
             );
-      throw new ExecFailure(failure.code, failure.message, status >= 500 && status < 600);
+      throw new ExecFailure(
+        failure.code,
+        failure.message,
+        status >= 500 && status < 600,
+        status,
+        parseProviderCode(text),
+      );
     }
     return text;
   }
@@ -635,7 +665,27 @@ export function createExeDevSandboxTransport(
       try {
         while ((await info(name, deadline)).state !== "running")
           await delay(1_000, undefined, { signal: deadline });
-        const check = await ssh(name, "true", 25_000, deadline);
+        // exe.dev reports a VM running before its sshd accepts connections.
+        let check: Awaited<ReturnType<typeof ssh>>;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            check = await ssh(name, "true", 25_000, deadline);
+            break;
+          } catch (error) {
+            if (
+              !(
+                error instanceof ExecFailure &&
+                error.status === 422 &&
+                error.providerCode === "vm_unreachable"
+              )
+            )
+              throw error;
+            await pauseBeforeProbe(
+              Math.min(4_000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2),
+              deadline,
+            );
+          }
+        }
         if (check.exitCode !== 0) throw new Error("VM did not run a command");
         return await info(name, deadline);
       } catch (error) {
