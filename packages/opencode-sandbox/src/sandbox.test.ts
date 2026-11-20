@@ -38,6 +38,7 @@ const actual = await import("@gitterm/sdk/sandbox");
 // Kept before mocking: mock.module also replaces it on `actual`.
 const realResolve = actual.resolveSandboxAccount;
 const captures: Parameters<typeof actual.captureSource>[1][] = [];
+const sandboxGet = mock(async () => ({}));
 mock.module("@gitterm/sdk/sandbox", () => ({
   ...actual,
   captureSource: async (directory: string, options: Parameters<typeof actual.captureSource>[1]) => {
@@ -68,7 +69,7 @@ mock.module("@gitterm/sdk/sandbox", () => ({
   createSandboxClient: () => ({
     identity: { mode: "direct", account: "e2b", provider: "e2b" },
     home: "/home/sandbox",
-    get: async () => ({}),
+    get: sandboxGet,
     sync: async () => ({ verified: true }),
     limits: { defaultLifetimeMinutes: 30, maxSandboxes: 2 },
     get capabilities() {
@@ -272,11 +273,13 @@ test("sandbox_sync takes the source limit from settings, not tool input", async 
   }
 });
 
-test("sandbox_sync rejects an invalid source limit before capture or approval", async () => {
+test("sandbox_sync rejects an invalid source limit before contacting the sandbox, capture, or approval", async () => {
   captures.length = 0;
   const { call, asked, unload } = await tools(undefined, { maxSourceMiB: 0 });
+  sandboxGet.mockClear();
   try {
     await expect(call("sandbox_sync", { sandboxId: "sbx" })).rejects.toThrow(/maxSourceMiB/);
+    expect(sandboxGet).not.toHaveBeenCalled();
     expect(captures).toHaveLength(0);
     expect(asked).toHaveLength(0);
   } finally {

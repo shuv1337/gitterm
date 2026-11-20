@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -85,4 +85,34 @@ test("sync takes the source limit from the settings file", async () => {
     runSandboxSync({ sandboxId: "sbx", json: true, yes: true }),
   );
   expect(captures).toEqual([{ exclude, maxBytes: 536870912 }]);
+});
+
+test("sync defaults to a 100 MiB source limit when the setting is unset", async () => {
+  const exclude = ["fixtures/large/**"];
+  captures.length = 0;
+  await withSettings({ exclude }, () =>
+    runSandboxSync({ sandboxId: "sbx", json: true, yes: true }),
+  );
+  expect(captures).toEqual([{ exclude, maxBytes: 104857600 }]);
+});
+
+test("sync exits with an error for an invalid source limit without capturing source", async () => {
+  captures.length = 0;
+  const exit = spyOn(process, "exit").mockImplementation(() => {
+    throw new Error("exit");
+  });
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(
+      withSettings({ maxSourceMiB: 0 }, () =>
+        runSandboxSync({ sandboxId: "sbx", json: true, yes: true }),
+      ),
+    ).rejects.toThrow("exit");
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("maxSourceMiB"));
+    expect(captures).toHaveLength(0);
+  } finally {
+    error.mockRestore();
+    exit.mockRestore();
+  }
 });

@@ -141,7 +141,7 @@ The account name is what [approval rules](#approvals) match. A single account in
 
 The `limits` values above are the defaults. What each limit does is in [Limits](/docs/reference/sandbox-plugin#limits).
 
-Archiving a checkout uses about three times its size in local memory. The sandbox needs disk space for the archive plus two copies of the files, and uploads can be slow on providers that write in small chunks, such as exe.dev.
+Archiving a checkout uses about three to five times its size in local memory, more for files that don't compress, such as images or archives. The sandbox needs disk space for the archive plus two copies of the files. On exe.dev, uploads use small chunks and each remote sync command has a 25-second timeout, so very large syncs can be slow or fail.
 
 ## Setup snapshots
 

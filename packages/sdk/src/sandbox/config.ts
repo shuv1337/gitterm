@@ -104,7 +104,7 @@ type SandboxOptions = {
   limits?: Partial<SandboxLimits>;
   /** Extra glob patterns never uploaded. Secret-like files are always excluded. */
   exclude?: string[];
-  /** Largest working tree sandbox_sync uploads, in MiB before compression (default 100, at most 1024). */
+  /** Largest working tree a sync uploads, in MiB before compression (default 100, at most 1024). */
   maxSourceMiB?: number;
   /**
    * Create every sandbox with public previews: anyone with a preview URL can open it.

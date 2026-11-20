@@ -691,6 +691,8 @@ describe("source snapshots", () => {
     expect(sourceLimitBytes(1024)).toBe(1024 * 1024 * 1024);
     for (const invalid of [0, -1, 1.5, NaN, Infinity, 1025, "512", null])
       expect(() => sourceLimitBytes(invalid as number)).toThrow(/maxSourceMiB/);
+    expect(() => sourceLimitBytes(NaN)).toThrow(/not NaN/);
+    expect(() => sourceLimitBytes(512n as unknown as number)).toThrow(/maxSourceMiB.*not 512/);
   });
 
   test("a checkout over the limit is refused until the user raises it", async () => {
@@ -701,7 +703,9 @@ describe("source snapshots", () => {
       const bytes = 101 * 1024 * 1024;
       await writeFile(file, "");
       await truncate(file, bytes);
-      await expect(captureSource(repo)).rejects.toThrow(/100 MiB sandbox sync limit.*maxSourceMiB/);
+      await expect(captureSource(repo)).rejects.toThrow(
+        /100 MiB sandbox sync limit.*raise "maxSourceMiB".*up to 1024 MiB/,
+      );
       const { snapshot } = await captureSource(repo, { maxBytes: sourceLimitBytes(512) });
       expect(snapshot.bytes).toBe(bytes);
     } finally {
@@ -863,7 +867,7 @@ describe("source snapshots", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gitterm-tar-"));
     try {
       const long = `${"nested/".repeat(20)}file-é.txt`;
-      const binary = Buffer.from([0, 1, 2, 255, 254, 10, 13]);
+      const binary = Buffer.from([99, 0, 1, 2, 255, 254, 10, 13, 99]).subarray(1, -1);
       await writeFile(
         path.join(directory, "a.tgz"),
         createTarGz([

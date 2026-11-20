@@ -19,10 +19,13 @@ export const MAX_SOURCE_LIMIT_MIB = 1024;
 
 export function sourceLimitBytes(maxSourceMiB?: number): number {
   if (maxSourceMiB === undefined) return MAX_SOURCE_BYTES;
-  if (!Number.isInteger(maxSourceMiB) || maxSourceMiB < 1 || maxSourceMiB > MAX_SOURCE_LIMIT_MIB)
+  if (!Number.isInteger(maxSourceMiB) || maxSourceMiB < 1 || maxSourceMiB > MAX_SOURCE_LIMIT_MIB) {
+    const value =
+      typeof maxSourceMiB === "string" ? JSON.stringify(maxSourceMiB) : String(maxSourceMiB);
     throw new Error(
-      `"maxSourceMiB" must be a whole number of MiB from 1 to ${MAX_SOURCE_LIMIT_MIB}, not ${JSON.stringify(maxSourceMiB)}.`,
+      `"maxSourceMiB" in the sandbox settings must be a whole number of MiB from 1 to ${MAX_SOURCE_LIMIT_MIB}, not ${value}.`,
     );
+  }
   return maxSourceMiB * 1024 * 1024;
 }
 
@@ -191,7 +194,7 @@ export async function captureSource(
     bytes += info.size;
     if (bytes > maxBytes)
       throw new Error(
-        `Source exceeds the ${Math.round(maxBytes / 1024 / 1024)} MiB sandbox sync limit. Exclude build output or large files. Only the user can raise the limit, with "maxSourceMiB" in the sandbox settings.`,
+        `Source exceeds the ${Math.round(maxBytes / 1024 / 1024)} MiB sandbox sync limit. Exclude build output or large files, or raise "maxSourceMiB" in the sandbox settings (up to ${MAX_SOURCE_LIMIT_MIB} MiB); the agent cannot change it.`,
       );
     // Hash and archive the same bytes so the manifest describes exactly what is uploaded.
     const data = await readFile(full);
