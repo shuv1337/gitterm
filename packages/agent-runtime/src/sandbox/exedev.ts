@@ -65,7 +65,7 @@ function checkExecBody(command: string) {
 function parseRetryAfter(value: string | null, now: number) {
   const header = value?.trim() ?? "";
   const ms = /^\d+$/.test(header) ? Number(header) * 1_000 : Date.parse(header) - now;
-  return Number.isFinite(ms) ? Math.max(0, ms) : undefined;
+  return Number.isFinite(ms) ? Math.min(60_000, Math.max(0, ms)) : undefined;
 }
 
 function checkUpload(result: { exitCode: number; stderr: string }) {
@@ -91,39 +91,49 @@ function execLimiter(clock: typeof execClock) {
   let refusals = 0;
   let cooldown = 0;
   let nextRequest = 0;
+  let priorityWaiters = 0;
   const waiters = new Set<() => void>();
+  const tokenAt = () => Math.max(cooldown, nextRequest);
+  const wakeIfReady = () => {
+    if (clock.now() >= tokenAt()) for (const wake of waiters) wake();
+  };
   return {
     async acquire(part: boolean, signal: AbortSignal) {
-      for (;;) {
-        signal.throwIfAborted();
-        const now = clock.now();
-        const wait = Math.max(cooldown, nextRequest) - now;
-        const limit = rate
-          ? Math.min(UPLOAD_CONCURRENCY, Math.ceil((rate * latency) / 1000) + 1)
-          : UPLOAD_CONCURRENCY;
-        if (wait <= 0 && (!part || activeParts < limit)) {
-          // One token at a time after a 429; time spent idle never saves up another burst.
-          if (rate) nextRequest = now + 1_000 / rate;
-          if (part) activeParts++;
-          return { generation, startedAt: now };
+      if (!part) priorityWaiters++;
+      try {
+        for (;;) {
+          signal.throwIfAborted();
+          const now = clock.now();
+          const wait = tokenAt() - now;
+          const limit = rate
+            ? Math.min(UPLOAD_CONCURRENCY, Math.ceil((rate * latency) / 1000) + 1)
+            : UPLOAD_CONCURRENCY;
+          if (wait <= 0 && (!part || (priorityWaiters === 0 && activeParts < limit))) {
+            // One token at a time after a 429; time spent idle never saves up another burst.
+            if (rate) nextRequest = now + 1_000 / rate;
+            if (part) activeParts++;
+            return { generation, startedAt: now };
+          }
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              cancel?.();
+              signal.removeEventListener("abort", wake);
+              waiters.delete(wake);
+              resolve();
+            };
+            const cancel = wait > 0 ? clock.timer(Math.ceil(wait), wake) : undefined;
+            waiters.add(wake);
+            signal.addEventListener("abort", wake, { once: true });
+          });
         }
-        await new Promise<void>((resolve) => {
-          const wake = () => {
-            cancel?.();
-            signal.removeEventListener("abort", wake);
-            waiters.delete(wake);
-            resolve();
-          };
-          const cancel = wait > 0 ? clock.timer(Math.min(wait, 2 ** 31 - 1), wake) : undefined;
-          waiters.add(wake);
-          signal.addEventListener("abort", wake, { once: true });
-        });
+      } finally {
+        if (!part && --priorityWaiters === 0) for (const wake of waiters) wake();
       }
     },
     release(part: boolean) {
       if (part) {
         activeParts--;
-        for (const wake of waiters) wake();
+        wakeIfReady();
       }
     },
     succeeded(admission: { generation: number; startedAt: number }, part: boolean) {
@@ -138,14 +148,17 @@ function execLimiter(clock: typeof execClock) {
     failed(admission: { generation: number }) {
       if (admission.generation === generation) successes = 0;
     },
-    refused(retryAfter: number | undefined) {
-      generation++;
-      successes = 0;
-      rate = rate ? Math.max(2, rate / 2) : 8;
+    refused(admission: { generation: number }, retryAfter: number | undefined) {
       const now = clock.now();
-      const cap = 500 * 2 ** Math.min(refusals++, 4);
-      cooldown = Math.max(cooldown, now + (retryAfter ?? cap * (0.5 + Math.random() / 2)));
-      nextRequest = Math.max(nextRequest, now + 1_000 / rate);
+      if (admission.generation === generation) {
+        generation++;
+        successes = 0;
+        rate = rate ? Math.max(2, rate / 2) : 8;
+        const cap = 500 * 2 ** Math.min(refusals++, 4);
+        retryAfter ??= cap * (0.5 + Math.random() / 2);
+        nextRequest = Math.max(nextRequest, now + 1_000 / rate);
+      }
+      if (retryAfter !== undefined) cooldown = Math.max(cooldown, now + retryAfter);
     },
   };
 }
@@ -154,6 +167,30 @@ function execLimiter(clock: typeof execClock) {
 function sshBody(id: string, command: string, seconds: number) {
   const remote = `timeout -k 3 ${seconds} bash -c ${shellQuote(command)}`;
   return `ssh ${id} ${shellQuote(remote)}`;
+}
+
+function uploadPart(
+  dir: string,
+  index: number,
+  attempt: number,
+  width: number,
+  hash: string,
+  content: string,
+) {
+  const temp = `t${index}.${attempt}`;
+  const name = `p${String(index).padStart(width, "0")}`;
+  return `cd -- ${dir} || exit 8
+          trap 'rm -f -- ${temp}' EXIT
+          printf '%s' '${content}' | base64 -d > ${temp} || exit 1
+          [ "$(sha256sum < ${temp} | cut -d' ' -f1)" = ${hash} ] || exit 9
+          mv -fT -- ${temp} ${name}`;
+}
+
+function payloadCapacity(id: string, command: string, seconds: number) {
+  return Math.min(
+    PART_BYTES,
+    3 * Math.floor((MAX_EXEC_BODY_BYTES - Buffer.byteLength(sshBody(id, command, seconds))) / 4),
+  );
 }
 
 /**
@@ -181,14 +218,18 @@ export function createExeDevSandboxTransport(
     action: string,
     accept = "text/plain",
     timeoutSeconds = 25,
-    signal = clock.deadline(REQUEST_DEADLINE_MS),
+    admissionSignal = clock.deadline(REQUEST_DEADLINE_MS),
     part = false,
+    onAdmission?: () => AbortSignal,
   ) {
     checkExecBody(command);
     for (;;) {
       let admission: Awaited<ReturnType<typeof limiter.acquire>> | undefined;
+      let signal = admissionSignal;
       try {
-        admission = await limiter.acquire(part, signal);
+        admission = await limiter.acquire(part, admissionSignal);
+        admissionSignal.throwIfAborted();
+        signal = onAdmission?.() ?? admissionSignal;
         signal.throwIfAborted();
         const timeout = clock.deadline((timeoutSeconds + 20) * 1000);
         const response = await fetch("https://exe.dev/exec", {
@@ -203,7 +244,10 @@ export function createExeDevSandboxTransport(
         });
         // A 429 refused the command before execution. Only this layer replays it.
         if (response.status === 429) {
-          limiter.refused(parseRetryAfter(response.headers.get("retry-after"), clock.now()));
+          limiter.refused(
+            admission,
+            parseRetryAfter(response.headers.get("retry-after"), clock.now()),
+          );
           void response.body?.cancel().catch(() => {});
           continue;
         }
@@ -328,6 +372,7 @@ export function createExeDevSandboxTransport(
     timeoutMs = 25_000,
     signal?: AbortSignal,
     part = false,
+    onAdmission?: () => AbortSignal,
   ) {
     const seconds = Math.max(1, Math.min(25, Math.floor(timeoutMs / 1000)));
     const action = "run a command";
@@ -339,6 +384,7 @@ export function createExeDevSandboxTransport(
         seconds,
         signal,
         part,
+        onAdmission,
       ),
       action,
     );
@@ -383,13 +429,14 @@ export function createExeDevSandboxTransport(
     id: string,
     command: string,
     timeoutMs: number,
-    deadline: AbortSignal,
+    outerDeadline?: AbortSignal,
   ) {
     const dir = `D="\${TMPDIR:-/tmp}/gitterm-run-${randomBytes(8).toString("hex")}"`;
     const bootMatches = `[ "$(cat "$D/boot" 2>/dev/null)" = "$(cat ${BOOT_ID})" ]`;
-    const readPid = `read -r pid < "$D/pid" && [[ "$pid" =~ ^[1-9][0-9]*$ ]]`;
+    const readPid = `read -r pid wrapper < "$D/pid" && [[ "$pid" =~ ^[1-9][0-9]*$ && "$wrapper" =~ ^[1-9][0-9]*$ ]]`;
     const wait = (remove: boolean) => `
       end=$((SECONDS + 20))
+      touch -c -- "$D" 2>/dev/null || :
       while ${bootMatches}; do
         if [ -f "$D/exit" ]; then
           printf 'done\\n%s\\n' "$(cat "$D/exit")"
@@ -401,7 +448,7 @@ export function createExeDevSandboxTransport(
           ${remove ? 'rm -rf -- "$D"' : ":"}
           exit 0
         fi
-        if [ -f "$D/pid" ] && ! (${readPid} && kill -0 "$pid" 2>/dev/null); then
+        if [ -f "$D/pid" ] && ! (${readPid} && kill -0 "$wrapper" 2>/dev/null); then
           [ -f "$D/exit" ] && continue
           break
         fi
@@ -419,7 +466,12 @@ export function createExeDevSandboxTransport(
         ${
           terminate
             ? `if [ ! -f "$D/exit" ] && ${bootMatches} && [ -f "$D/pid" ] && ${readPid}; then
-                kill -TERM -- "-$pid" 2>/dev/null || :
+                 if kill -TERM "$pid" 2>/dev/null; then
+                   end=$((SECONDS + 7))
+                   while [ ! -f "$D/exit" ] && kill -0 "$wrapper" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do
+                     sleep 0.1
+                   done
+                 fi
               fi`
             : ""
         }
@@ -427,25 +479,35 @@ export function createExeDevSandboxTransport(
         10_000,
         clock.deadline(CLEANUP_DEADLINE_MS),
       ).catch(() => {});
-    const detached = `timeout -k 5 ${Math.ceil(timeoutMs / 1000)} bash cmd >out 2>err &
+    const detached = `timeout -k 5 ${Math.ceil(timeoutMs / 1000)} bash "$1/cmd" >"$1/out" 2>"$1/err" &
       pid=$!
-      printf '%s\\n' "$pid" >pid.tmp && mv -f pid.tmp pid
+      printf '%s %s\\n' "$pid" "$$" >"$1/pid.tmp" && mv -f -- "$1/pid.tmp" "$1/pid"
       wait "$pid"
-      printf '%s\\n' "$?" >exit.tmp && mv -f exit.tmp exit`;
+      printf '%s\\n' "$?" >"$1/exit.tmp" && mv -f -- "$1/exit.tmp" "$1/exit"`;
     const launch = `
       set -e
       ${dir}
       find "\${TMPDIR:-/tmp}" -maxdepth 1 -regextype posix-extended -type d \\
-        -regex '.*/gitterm-run-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} +
-      mkdir -m 700 -- "$D"
-      umask 077
-      printf '%s' '${Buffer.from(command).toString("base64")}' | base64 -d > "$D/cmd"
-      cat ${BOOT_ID} > "$D/boot"
-      (cd -- "$D" && setsid nohup sh -c ${shellQuote(detached)} </dev/null >/dev/null 2>&1 &)
-      ${wait(true)}`;
+         -regex '.*/gitterm-run-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || :
+       (umask 077
+        mkdir -m 700 -- "$D"
+        printf '%s' '${Buffer.from(command).toString("base64")}' | base64 -d > "$D/cmd"
+        cat ${BOOT_ID} > "$D/boot"
+        touch -- "$D/out" "$D/err" "$D/pid.tmp" "$D/exit.tmp")
+       setsid nohup sh -c ${shellQuote(detached)} sh "$D" </dev/null >/dev/null 2>&1 &
+       ${wait(true)}`;
     checkExecBody(sshBody(id, launch, 25));
+    const admissionDeadline = outerDeadline ?? clock.deadline(REQUEST_DEADLINE_MS);
+    let deadline = admissionDeadline;
     try {
-      let result = await ssh(id, launch, 25_000, deadline);
+      let result = await ssh(id, launch, 25_000, admissionDeadline, false, () => {
+        // A refused launch did not start a VM process. Start this budget at each admission.
+        const executionDeadline = clock.deadline(timeoutMs + 20_000);
+        deadline = outerDeadline
+          ? AbortSignal.any([outerDeadline, executionDeadline])
+          : executionDeadline;
+        return deadline;
+      });
       let polled = false;
       for (;;) {
         deadline.throwIfAborted();
@@ -490,7 +552,7 @@ export function createExeDevSandboxTransport(
       }
     } catch (error) {
       await reap(true);
-      if (deadline.aborted)
+      if (deadline.aborted || admissionDeadline.aborted)
         throw new SandboxProviderError("timeout", "Timed out waiting for the exe.dev command.");
       throw error;
     }
@@ -500,6 +562,7 @@ export function createExeDevSandboxTransport(
     id: string,
     dir: string,
     data: Uint8Array,
+    partSize: number,
     count: number,
     deadline: AbortSignal,
     uploaded: (bytes: number) => void,
@@ -508,23 +571,19 @@ export function createExeDevSandboxTransport(
     const signal = AbortSignal.any([controller.signal, deadline]);
     let next = 0;
     let remainingRetries = Math.max(8, Math.floor(count * 0.02));
+    const width = Math.max(6, String(count - 1).length);
     async function worker() {
       while (next < count) {
         const index = next++;
-        const part = data.subarray(index * PART_BYTES, (index + 1) * PART_BYTES);
+        const part = data.subarray(index * partSize, (index + 1) * partSize);
         const hash = sha256(part);
-        const name = `p${String(index).padStart(6, "0")}`;
+        const content = base64(part);
         for (let attempt = 0; ; attempt++) {
           try {
-            const temp = `t${index}.${attempt}`;
             checkUpload(
               await ssh(
                 id,
-                `cd -- ${dir} || exit 8
-                trap 'rm -f -- ${temp}' EXIT
-                printf '%s' '${base64(part)}' | base64 -d > ${temp} || exit 1
-                [ "$(sha256sum < ${temp} | cut -d' ' -f1)" = ${hash} ] || exit 9
-                mv -fT -- ${temp} ${name}`,
+                uploadPart(dir, index, attempt, width, hash, content),
                 10_000,
                 signal,
                 true,
@@ -575,15 +634,18 @@ export function createExeDevSandboxTransport(
         `new --name=${name} --no-email --image=${shellQuote(input.template ?? config.image ?? DEFAULT_EXEDEV_SANDBOX_IMAGE)}${size} --json`,
         "create a sandbox",
       );
+      const deadline = clock.deadline(REQUEST_DEADLINE_MS);
       try {
-        const deadline = clock.deadline(REQUEST_DEADLINE_MS);
         while ((await info(name, deadline)).state !== "running")
           await delay(1_000, undefined, { signal: deadline });
         const check = await ssh(name, "true", 25_000, deadline);
         if (check.exitCode !== 0) throw new Error("VM did not run a command");
         return await info(name, deadline);
       } catch (error) {
-        return discardFailedCreate(() => exec(`rm ${name}`, "delete the sandbox"), name, error);
+        const failure = deadline.aborted
+          ? new SandboxProviderError("timeout", "Timed out waiting for the exe.dev VM.")
+          : error;
+        return discardFailedCreate(() => exec(`rm ${name}`, "delete the sandbox"), name, failure);
       }
     },
 
@@ -614,9 +676,7 @@ export function createExeDevSandboxTransport(
 
     async run(id, command, options = {}) {
       const vmTimeout = options.timeoutMs ?? 25_000;
-      const deadline = clock.deadline(
-        vmTimeout > 30_000 ? vmTimeout + 20_000 : REQUEST_DEADLINE_MS,
-      );
+      const deadline = clock.deadline(REQUEST_DEADLINE_MS);
       await running(id, deadline);
       const exports = Object.entries(options.env ?? {})
         .map(([key, value]) => {
@@ -626,8 +686,7 @@ export function createExeDevSandboxTransport(
         })
         .join("");
       const cd = options.cwd ? `cd ${shellQuote(options.cwd)} && ` : "";
-      if (vmTimeout > 30_000)
-        return runDetached(id, `${exports}${cd}${command}`, vmTimeout, deadline);
+      if (vmTimeout > 30_000) return runDetached(id, `${exports}${cd}${command}`, vmTimeout);
       return ssh(id, `${exports}${cd}${command}`, vmTimeout, deadline);
     },
 
@@ -640,50 +699,56 @@ export function createExeDevSandboxTransport(
       const temp = shellQuote(`${file}.gitterm-${nonce}.tmp`);
       const verify = `[ "$(sha256sum < "$T" | cut -d' ' -f1)" = ${sha256(data)} ]`;
       const stage = `T=${temp}; trap 'rm -f -- "$T"' EXIT`;
-      const count = Math.ceil(data.byteLength / PART_BYTES);
       const dir = shellQuote(`${file}.gitterm-parts-${nonce}`);
-      let staged = false;
-      let bytesDone = 0;
-      try {
-        await running(id, deadline);
-        staged = true;
-        if (count <= 1) {
-          checkUpload(
-            await ssh(
-              id,
-              `
+      const pathTooLong = () =>
+        new SandboxProviderError(
+          "provider",
+          `Upload path (${Buffer.byteLength(path)} bytes) is too long for the exe.dev request limit.`,
+        );
+      const timedOut = (bytes: number) =>
+        new SandboxProviderError(
+          "timeout",
+          `exe.dev upload timed out (${bytes}/${data.byteLength} bytes uploaded).`,
+        );
+      const single = (content: string) => `
           set -e
           mkdir -p -- ${parent}
           ${stage}
-          printf '%s' '${base64(data)}' | base64 -d > "$T"
+          printf '%s' '${content}' | base64 -d > "$T"
           ${verify} || exit 9
-          mv -fT -- "$T" ${target}`,
-              25_000,
-              deadline,
-            ),
-          );
-          return;
+          mv -fT -- "$T" ${target}`;
+      const singleCapacity = payloadCapacity(id, single(""), 25);
+      if (singleCapacity >= data.byteLength) {
+        let staged = false;
+        try {
+          await running(id, deadline);
+          staged = true;
+          checkUpload(await ssh(id, single(base64(data)), 25_000, deadline));
+        } catch (error) {
+          if (!deadline.aborted) throw error;
+          if (staged)
+            await ssh(id, `rm -f -- ${temp}`, 10_000, clock.deadline(CLEANUP_DEADLINE_MS)).catch(
+              () => {},
+            );
+          throw timedOut(0);
         }
-        checkUpload(
-          await ssh(
-            id,
-            `
+        return;
+      }
+      const maxIndex = Math.floor(data.byteLength / 3);
+      const partSize = payloadCapacity(id, uploadPart(dir, maxIndex, 3, 6, "0".repeat(64), ""), 10);
+      if (partSize < 3) throw pathTooLong();
+      const count = Math.ceil(data.byteLength / partSize);
+      if (count === 0) throw pathTooLong();
+      const begin = `
           set -eo pipefail
           mkdir -p -- ${parent}
           find ${parent} -maxdepth 1 -regextype posix-extended -type d \\
-            -regex '.*\\.gitterm-parts-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} +
+            -regex '.*\\.gitterm-parts-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || :
           space=$(df -Pk -- ${parent} | awk 'NR == 2 { print $4 }')
           [[ "$space" =~ ^[0-9]+$ ]] || exit 1
           [ "$space" -ge ${Math.ceil((2 * data.byteLength + 64 * 1024 * 1024) / 1024)} ] || exit 10
-           mkdir -m 700 -- ${dir}`,
-            25_000,
-            deadline,
-          ),
-        );
-        await uploadParts(id, dir, data, count, deadline, (bytes) => {
-          bytesDone += bytes;
-        });
-        const assemble = `
+          mkdir -m 700 -- ${dir}`;
+      const assemble = `
           set -e
           export LC_ALL=C
           U=${dir}
@@ -695,30 +760,36 @@ export function createExeDevSandboxTransport(
           [ "$(wc -c < "$T")" -eq ${data.byteLength} ] && ${verify} || exit 9
           mv -fT -- "$T" ${target}
           rm -rf -- "$U"`;
+      if (
+        [begin, assemble].some(
+          (script) => Buffer.byteLength(sshBody(id, script, 25)) > MAX_EXEC_BODY_BYTES,
+        )
+      )
+        throw pathTooLong();
+      let staged = false;
+      let bytesDone = 0;
+      try {
+        await running(id, deadline);
+        staged = true;
+        checkUpload(await ssh(id, begin, 25_000, deadline));
+        await uploadParts(id, dir, data, partSize, count, deadline, (bytes) => {
+          bytesDone += bytes;
+        });
         checkUpload(
           data.byteLength > 256 * 1024 * 1024
-            ? await runDetached(
-                id,
-                assemble,
-                120_000,
-                AbortSignal.any([deadline, clock.deadline(140_000)]),
-              )
+            ? await runDetached(id, assemble, 120_000, deadline)
             : await ssh(id, assemble, 25_000, deadline),
         );
       } catch (error) {
-        const timedOut = deadline.aborted;
-        if (staged && (count > 1 || timedOut))
+        const expired = deadline.aborted;
+        if (staged)
           await ssh(
             id,
             `rm -rf -- ${dir} ${temp}`,
             10_000,
             clock.deadline(CLEANUP_DEADLINE_MS),
           ).catch(() => {});
-        if (timedOut)
-          throw new SandboxProviderError(
-            "timeout",
-            `exe.dev upload timed out (${bytesDone}/${data.byteLength} bytes uploaded).`,
-          );
+        if (expired) throw timedOut(bytesDone);
         throw error;
       }
     },

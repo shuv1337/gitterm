@@ -1,6 +1,16 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as realDelay } from "node:timers/promises";
@@ -204,6 +214,11 @@ test("destroy discards the cached preview key", async () => {
 const partAttempt = /\bt(\d+)\.(\d+)\b/;
 const upload = (clock?: Parameters<typeof createExeDevSandboxTransport>[1]) =>
   createExeDevSandboxTransport({ apiKey: "test-token" }, clock);
+const returnRunningWhenReady = (command: string) =>
+  command.replace(
+    'if [ "$SECONDS" -ge "$end" ]; then',
+    'if [ -f "$D/pid" ] && [ -f ready ]; then echo running; exit 0; fi\n        if [ "$SECONDS" -ge "$end" ]; then',
+  );
 
 function localVm(
   intercept?: (
@@ -211,6 +226,7 @@ function localVm(
     bash: (command: string) => Promise<Response>,
     signal?: AbortSignal,
   ) => Response | Promise<Response> | undefined,
+  status?: () => Response | undefined,
 ) {
   const root = (tmp = mkdtempSync(join(tmpdir(), "gitterm-exedev-")));
   randomSpy = spyOn(Math, "random").mockReturnValue(0);
@@ -222,8 +238,18 @@ function localVm(
     else jobs++;
     try {
       const child = Bun.spawn(
-        ["bash", "-c", `ssh() { [ "$#" = 2 ] || return 99; bash -c "$2"; }\n${command}`],
-        { cwd: root, env: { ...process.env, TMPDIR: root }, stdout: "pipe", stderr: "pipe" },
+        ["bash", "-c", `umask 022\nssh() { [ "$#" = 2 ] || return 99; bash -c "$2"; }\n${command}`],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            HOME: root,
+            TMPDIR: root,
+            PATH: `${join(root, "bin")}:${process.env.PATH}`,
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
       );
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(child.stdout).arrayBuffer(),
@@ -246,7 +272,7 @@ function localVm(
     expect(Buffer.byteLength(command)).toBeLessThanOrEqual(64_000);
     commands.push(command);
     return intercept?.(command, bash, signal) ?? bash(command);
-  });
+  }, status);
   return { root, commands, busy: () => jobs > 0 };
 }
 
@@ -273,7 +299,8 @@ function fakeClock() {
         settled = true;
       });
       void result.catch(() => {});
-      while (!settled) {
+      for (;;) {
+        if (settled) return await result;
         if (busy()) {
           await realDelay(1);
           continue;
@@ -288,7 +315,6 @@ function fakeClock() {
           timer.fire();
         }
       }
-      return await result;
     },
   };
 }
@@ -338,6 +364,20 @@ test("parallel parts fit the body limit and atomically assemble a hostile path",
   expect(commands).toHaveLength(28);
   expect(peak).toBeGreaterThan(1);
   expect(peak).toBeLessThanOrEqual(8);
+});
+
+test("uploads shrink parts to fit a long quote-heavy path", async () => {
+  const { root, commands } = localVm();
+  const parent = Array.from({ length: 2 }, () => "'".repeat(110)).join("/");
+  const path = join(parent, "file");
+  const data = randomBytes(45 * 1024);
+  await upload().writeFile(id, path, data);
+  expect(commands.filter((command) => partAttempt.test(command))).toHaveLength(2);
+  expect(readFileSync(join(root, path)).equals(data)).toBe(true);
+  expect(readdirSync(join(root, parent))).toEqual(["file"]);
+  await expect(upload().writeFile(id, "'".repeat(10_000), data)).rejects.toThrow(
+    "Upload path (10000 bytes)",
+  );
 });
 
 test.each(["504", "fetch throw", "missing exit", "error frame", "corrupt part", "124", "137"])(
@@ -411,6 +451,60 @@ test("a burst transitions to paced uploads under a sustained provider rate limit
   expect(burstPeak).toBe(8);
   expect(pacedPeak).toBeGreaterThan(0);
   expect(pacedPeak).toBeLessThanOrEqual(3);
+});
+
+test("eight simultaneous 429s back off once, then prioritize a status request", async () => {
+  const clock = fakeClock();
+  let refusedAt: number | undefined;
+  let firstBurst = 0;
+  let statusChecks = 0;
+  const admitted: Array<{ time: number; kind: string }> = [];
+  const sandbox = upload(clock);
+  let status: ReturnType<typeof sandbox.info> | undefined;
+  const { root, busy } = localVm(
+    (command, bash) => {
+      if (!partAttempt.test(command)) return bash(command);
+      if (++firstBurst <= 8) {
+        refusedAt ??= clock.now();
+        if (firstBurst === 8)
+          clock.timer(100, () => {
+            status = sandbox.info(id);
+          });
+        return new Response(null, { status: 429 });
+      }
+      admitted.push({ time: clock.now(), kind: "part" });
+      return bash(command);
+    },
+    () => {
+      if (++statusChecks > 1) admitted.push({ time: clock.now(), kind: "status" });
+      return undefined;
+    },
+  );
+  randomSpy?.mockReturnValue(0.998);
+  await clock.run(sandbox.writeFile(id, join(root, "file"), randomBytes(8 * 45 * 1024)), busy);
+  await status;
+  expect(admitted[0]?.kind).toBe("status");
+  expect(admitted[0]!.time - refusedAt!).toBe(500);
+  expect(admitted.map(({ time }) => time - admitted[0]!.time)).toEqual(
+    Array.from({ length: 9 }, (_, index) => index * 125),
+  );
+});
+
+test("stale burst responses still honor a capped explicit Retry-After", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  let calls = 0;
+  const finished: number[] = [];
+  fetchSpy = mockExec((command) => {
+    expect(command).toBe("ls --json");
+    if (++calls === 1) return new Response(null, { status: 429 });
+    if (calls === 2) return new Response(null, { status: 429, headers: { "retry-after": "600" } });
+    finished.push(clock.now() - start);
+    return Response.json({ vms: [] });
+  });
+  const sandbox = upload(clock);
+  await clock.run(Promise.all([sandbox.list({}), sandbox.list({})]));
+  expect(finished).toEqual([60_000, 60_125]);
 });
 
 test("200 refusals do not spend part attempts or the upload retry budget", async () => {
@@ -573,19 +667,126 @@ test("a fast long-timeout command returns both streams and exit in its launch re
   const cwd = join(root, `dir ' " é`);
   mkdirSync(cwd);
   const value = `$HOME " ' é\nline`;
-  const result = await upload().run(
-    id,
-    `sleep 1; printf '%s\\n' "$PWD" "$VALUE"; echo error >&2; exit 7`,
-    {
-      cwd,
-      env: { VALUE: value },
-      timeoutMs: 120_000,
-    },
-  );
+  const result = await upload().run(id, `printf '%s\\n' "$PWD" "$VALUE"; echo error >&2; exit 7`, {
+    cwd,
+    env: { VALUE: value },
+    timeoutMs: 120_000,
+  });
   expect(result).toEqual({ exitCode: 7, stdout: `${cwd}\n${value}\n`, stderr: "error\n" });
   expect(commands).toHaveLength(1);
   expect(commands[0]).toContain("timeout -k 3 25 ");
   expect(readdirSync(root)).toEqual([`dir ' " é`]);
+});
+
+test("a detached command without cwd inherits the short command's cwd and umask", async () => {
+  const { root } = localVm();
+  const sandbox = upload();
+  const command = `pwd; umask; printf data > "$1"; stat -c %a "$1"`;
+  const short = await sandbox.run(id, `set -- short; ${command}`);
+  const detached = await sandbox.run(id, `set -- long; ${command}`, { timeoutMs: 60_000 });
+  expect(short).toEqual({ exitCode: 0, stdout: `${root}\n0022\n644\n`, stderr: "" });
+  expect(detached).toEqual(short);
+  expect(readFileSync(join(root, "long"), "utf8")).toBe("data");
+  expect(readdirSync(root).toSorted()).toEqual(["long", "short"]);
+});
+
+test("a detached wrapper remains live after its timeout child exits, until it records exit", async () => {
+  const { root } = localVm((command, bash) => {
+    if (!command.includes("setsid nohup")) return bash(command);
+    return bash(
+      command
+        .replace('wait "$pid"\n', 'wait "$pid"\n      status=$?; sleep 0.15; (exit "$status")\n')
+        .replace("sleep 0.25", "sleep 0.02"),
+    );
+  });
+  const sandbox = upload();
+  for (let run = 0; run < 8; run++) {
+    expect(await sandbox.run(id, "echo ok; exit 7", { timeoutMs: 60_000 })).toEqual({
+      exitCode: 7,
+      stdout: "ok\n",
+      stderr: "",
+    });
+  }
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("reaping signals timeout so the command's EXIT trap runs and the process group stops", async () => {
+  let group = 0;
+  const { root } = localVm((command, bash) => {
+    if (command.includes("setsid nohup")) return bash(returnRunningWhenReady(command));
+    if (command.includes("echo lost")) {
+      const dir = readdirSync(root).find((name) => name.startsWith("gitterm-run-"))!;
+      group = Number(readFileSync(join(root, dir, "pid"), "utf8").split(" ")[0]);
+      return new Response(null, { status: 403 });
+    }
+    return bash(command);
+  });
+  try {
+    await expect(
+      upload().run(
+        id,
+        `mkdir publish.lock; trap 'sleep 0.2; rmdir publish.lock; touch trapped' EXIT; touch ready; while :; do sleep 30; done`,
+        { timeoutMs: 60_000 },
+      ),
+    ).rejects.toMatchObject({ code: "auth" });
+    expect(readdirSync(root).toSorted()).toEqual(["ready", "trapped"]);
+    expect(group).toBeGreaterThan(1);
+    const ps = Bun.spawnSync(["ps", "-eo", "pgid=,stat="]);
+    expect(ps.exitCode).toBe(0);
+    const live = ps.stdout
+      .toString()
+      .trim()
+      .split("\n")
+      .some((line) => {
+        const [pgid, state] = line.trim().split(/\s+/);
+        return Number(pgid) === group && !state?.startsWith("Z");
+      });
+    expect(live).toBe(false);
+  } finally {
+    if (group > 1) {
+      try {
+        process.kill(-group, "SIGKILL");
+      } catch {
+        /* Already exited. */
+      }
+    }
+  }
+});
+
+test("upload and launch sweeps tolerate a disappearing directory and only delete old entries", async () => {
+  const { root } = localVm();
+  const paths = [
+    "gitterm-run-0123456789abcdef",
+    "gitterm-run-fedcba9876543210",
+    "file.gitterm-parts-0123456789abcdef",
+    "file.gitterm-parts-fedcba9876543210",
+  ];
+  for (const name of paths) mkdirSync(join(root, name));
+  const old = new Date(Date.now() - 3_700_000);
+  for (const index of [0, 2]) utimesSync(join(root, paths[index]!), old, old);
+  mkdirSync(join(root, "bin"));
+  mkdirSync(join(root, "vanished"));
+  writeFileSync(
+    join(root, "bin/find"),
+    `#!/bin/sh
+set -e
+/usr/bin/find "$@"
+rm -rf vanished
+echo 'find: vanished: No such file or directory' >&2
+exit 1
+`,
+    { mode: 0o755 },
+  );
+  const sandbox = upload();
+  expect(await sandbox.run(id, "echo ok", { timeoutMs: 60_000 })).toEqual({
+    exitCode: 0,
+    stdout: "ok\n",
+    stderr: "",
+  });
+  mkdirSync(join(root, "vanished"));
+  await sandbox.writeFile(id, "file", randomBytes(100 * 1024));
+  expect(paths.map((path) => existsSync(join(root, path)))).toEqual([false, true, false, true]);
+  expect(existsSync(join(root, "vanished"))).toBe(false);
 });
 
 test("a lost detached command is a provider failure, not an exit status", async () => {
@@ -609,23 +810,106 @@ test("a lost detached command is a provider failure, not an exit status", async 
 
 test("a completed poll can be replayed when its response is lost", async () => {
   let polls = 0;
+  let refreshed = false;
   const { root, commands } = localVm(async (command, bash) => {
-    if (command.includes("setsid nohup"))
-      return bash(command.replace("SECONDS + 20", "SECONDS + 1"));
+    if (command.includes("setsid nohup")) return bash(returnRunningWhenReady(command));
     if (command.includes("echo lost") && ++polls === 1) {
-      await bash(command);
+      const dir = join(root, readdirSync(root).find((name) => name.startsWith("gitterm-run-"))!);
+      const old = new Date(Date.now() - 3_700_000);
+      utimesSync(dir, old, old);
+      const result = bash(
+        command.replace('while [ "$(cat "$D/boot"', 'touch polled\n      while [ "$(cat "$D/boot"'),
+      );
+      for (let attempt = 0; attempt < 100 && !existsSync(join(root, "polled")); attempt++)
+        await realDelay(10);
+      refreshed = statSync(dir).mtimeMs > old.getTime() + 3_600_000;
+      writeFileSync(join(root, "release"), "");
+      await result;
       throw new Error("connection closed");
     }
     return bash(command);
   });
-  expect(await upload().run(id, "sleep 2; echo ok", { timeoutMs: 60_000 })).toEqual({
+  expect(
+    await upload().run(id, "touch ready; while [ ! -f release ]; do sleep 0.02; done; echo ok", {
+      timeoutMs: 60_000,
+    }),
+  ).toEqual({
     exitCode: 0,
     stdout: "ok\n",
     stderr: "",
   });
   expect(polls).toBe(2);
+  expect(refreshed).toBe(true);
   expect(commands).toHaveLength(4);
-  expect(readdirSync(root)).toEqual([]);
+  expect(readdirSync(root).toSorted()).toEqual(["polled", "ready", "release"]);
+});
+
+test("a throttled detached launch gets its full client deadline after admission", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const acceptedAt: number[] = [];
+  let statuses = 0;
+  let launches = 0;
+  const refuse = () => new Response(null, { status: 429, headers: { "retry-after": "45" } });
+  const { busy } = localVm(
+    (command, bash, signal) => {
+      if (command.includes("setsid nohup")) {
+        if (++launches === 1) return refuse();
+        acceptedAt.push(clock.now() - start);
+        return ndjson({ stdout: "cnVubmluZwo=" }, { exit_code: 0 });
+      }
+      if (command.includes("echo lost"))
+        return new Promise((resolve, reject) => {
+          const cancel = clock.timer(40_000, () => {
+            signal?.removeEventListener("abort", abort);
+            resolve(
+              ndjson(
+                { stdout: Buffer.from("done\n0\n3\nb2sK\n0\n\n").toString("base64") },
+                { exit_code: 0 },
+              ),
+            );
+          });
+          const abort = () => {
+            cancel();
+            reject(signal?.reason);
+          };
+          signal?.addEventListener("abort", abort, { once: true });
+        });
+      return bash(command);
+    },
+    () => (++statuses === 1 ? refuse() : undefined),
+  );
+  expect(await clock.run(upload(clock).run(id, "echo ok", { timeoutMs: 45_000 }), busy)).toEqual({
+    exitCode: 0,
+    stdout: "ok\n",
+    stderr: "",
+  });
+  expect(launches).toBe(2);
+  expect(acceptedAt[0]).toBeGreaterThanOrEqual(90_000);
+});
+
+test("creation reports the VM wait deadline and deletes the unfinished VM", async () => {
+  const clock = fakeClock();
+  let name: string | undefined;
+  let removed = false;
+  fetchSpy = mockExec((command) => {
+    if (command.startsWith("new ")) {
+      name = /--name=([a-z0-9-]+)/.exec(command)?.[1];
+      return Response.json({});
+    }
+    if (command === `ls ${name} --json`)
+      return new Response(null, { status: 429, headers: { "retry-after": "60" } });
+    expect(command).toBe(`rm ${name}`);
+    removed = true;
+    return Response.json({});
+  });
+  await expect(
+    clock.run(upload(clock).create({ timeoutMs: 60_000, labels: {} })),
+  ).rejects.toMatchObject({
+    code: "timeout",
+    message: "Timed out waiting for the exe.dev VM.",
+  });
+  expect(removed).toBe(true);
 });
 
 test("a detached poll waits out a 429 and collects the result", async () => {
