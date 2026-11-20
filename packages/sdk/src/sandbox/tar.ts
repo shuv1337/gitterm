@@ -45,7 +45,8 @@ function paxRecord(key: string, value: string): Buffer {
 
 function padded(data: Uint8Array): Buffer[] {
   const remainder = data.byteLength % BLOCK;
-  return remainder ? [Buffer.from(data), Buffer.alloc(BLOCK - remainder)] : [Buffer.from(data)];
+  const view = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return remainder ? [view, Buffer.alloc(BLOCK - remainder)] : [view];
 }
 
 export function createTarGz(entries: TarEntry[]): Buffer {

@@ -133,7 +133,7 @@ Excluded and reported:
 - paths matching the configured `exclude` globs
 - submodules (gitlinks)
 
-Unresolved merge conflicts and sources over 100 MiB are rejected.
+Unresolved merge conflicts are rejected. The default sync limit is 100 MiB before compression; users can raise it to 1024 MiB with `maxSourceMiB` in the sandbox settings.
 
 The snapshot id is `snap_` plus the first 16 hex characters of a sha256 over the sorted
 manifest (`kind sha256 path` per file). The upload is a tar.gz built in process. In the

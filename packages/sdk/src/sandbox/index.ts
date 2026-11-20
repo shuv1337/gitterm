@@ -52,8 +52,10 @@ export {
 export {
   captureSource,
   MAX_SOURCE_BYTES,
+  MAX_SOURCE_LIMIT_MIB,
   projectDir,
   sensitivePath,
+  sourceLimitBytes,
   type CapturedSource,
   type SnapshotFile,
   type SourceSnapshot,
