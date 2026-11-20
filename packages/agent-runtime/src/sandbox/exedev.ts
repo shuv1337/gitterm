@@ -94,9 +94,6 @@ function execLimiter(clock: typeof execClock) {
   let priorityWaiters = 0;
   const waiters = new Set<() => void>();
   const tokenAt = () => Math.max(cooldown, nextRequest);
-  const wakeIfReady = () => {
-    if (clock.now() >= tokenAt()) for (const wake of waiters) wake();
-  };
   return {
     async acquire(part: boolean, signal: AbortSignal) {
       if (!part) priorityWaiters++;
@@ -133,7 +130,7 @@ function execLimiter(clock: typeof execClock) {
     release(part: boolean) {
       if (part) {
         activeParts--;
-        wakeIfReady();
+        for (const wake of waiters) wake();
       }
     },
     succeeded(admission: { generation: number; startedAt: number }, part: boolean) {
@@ -552,7 +549,7 @@ export function createExeDevSandboxTransport(
       }
     } catch (error) {
       await reap(true);
-      if (deadline.aborted || admissionDeadline.aborted)
+      if (deadline.aborted)
         throw new SandboxProviderError("timeout", "Timed out waiting for the exe.dev command.");
       throw error;
     }

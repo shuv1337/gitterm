@@ -490,6 +490,30 @@ test("eight simultaneous 429s back off once, then prioritize a status request", 
   );
 });
 
+test("a 429 during paced uploads wakes parts waiting for concurrency", async () => {
+  const clock = fakeClock();
+  const attempts = [0, 0, 0, 0];
+  const { root, busy } = localVm(async (command, bash) => {
+    const match = partAttempt.exec(command);
+    if (!match) return bash(command);
+    const index = Number(match[1]);
+    const attempt = ++attempts[index]!;
+    if (attempt === 1) return new Response(null, { status: 429 });
+    // p2 and p3 are waiting for capacity when p0's refusal pushes the next slot back.
+    if (index === 0 && attempt === 2) {
+      await new Promise<void>((resolve) => clock.timer(350, resolve));
+      return new Response(null, { status: 429 });
+    }
+    if (index === 1) await new Promise<void>((resolve) => clock.timer(700, resolve));
+    return bash(command);
+  });
+  const data = randomBytes(4 * 45 * 1024);
+  const path = join(root, "file");
+  await clock.run(upload(clock).writeFile(id, path, data), busy);
+  expect(attempts).toEqual([3, 2, 2, 2]);
+  expect(readFileSync(path).equals(data)).toBe(true);
+});
+
 test("stale burst responses still honor a capped explicit Retry-After", async () => {
   const clock = fakeClock();
   const start = clock.now();
@@ -806,6 +830,28 @@ test("a lost detached command is a provider failure, not an exit status", async 
   });
   expect(polls).toBe(2);
   expect(commands.at(-1)).toContain("rm -rf");
+});
+
+test.each([
+  { code: "provider", message: "exe.dev lost the detached command." },
+  { code: "auth", message: expect.stringContaining("exe.dev rejected the token") },
+])("a detached poll preserves $code after the launch admission deadline", async (failure) => {
+  const clock = fakeClock();
+  const running = () => ndjson({ stdout: "cnVubmluZwo=" }, { exit_code: 0 });
+  let polls = 0;
+  const { busy } = localVm(async (command, bash) => {
+    if (command.includes("setsid nohup")) return running();
+    if (!command.includes("echo lost")) return bash(command);
+    await new Promise<void>((resolve) => clock.timer(20_000, resolve));
+    if (++polls < 7) return running();
+    return failure.code === "auth"
+      ? new Response(null, { status: 403 })
+      : ndjson({ stdout: "bG9zdAo=" }, { exit_code: 0 });
+  });
+  await expect(
+    clock.run(upload(clock).run(id, "true", { timeoutMs: 300_000 }), busy),
+  ).rejects.toMatchObject(failure);
+  expect(polls).toBe(7);
 });
 
 test("a completed poll can be replayed when its response is lost", async () => {
