@@ -55,7 +55,7 @@ Direct sandboxes are never paused or resumed.
 
 **Boat.** The base image cannot be replaced. It includes coding agent CLIs (`claude`, `codex`, `opencode`). Gitterm never starts them and gives them no credentials. At its lifetime the sandbox is archived, not deleted, and the storage remains until you destroy it. A file read returns at most 5 MiB, which limits artifacts. Boat has no labels, so the owning account is kept as a hash in the sandbox name.
 
-**exe.dev.** The token needs `new`, `ls`, `ssh`, `pause`, `resume`, and `rm`. Private previews also need the exact `ssh-key generate-api-key` permission. Each request is limited to 30 seconds and 64 KB, so jobs start detached and large syncs are slow. Previews support ports 3000 to 9999. The owning account is kept as a hash in the sandbox name.
+**exe.dev.** The token needs `new`, `ls`, `ssh`, `pause`, `resume`, and `rm`. Private previews also need the exact `ssh-key generate-api-key` permission. Requests are limited to 30 seconds and 64 KB. Jobs and longer sync commands run detached. Uploads send verified chunks in parallel, then slow down when exe.dev rate-limits the token. In testing, exe.dev accepted a burst of a few hundred requests and then about 10 requests per second. Previews support ports 3000 to 9999. The owning account is kept as a hash in the sandbox name.
 
 With a non-expiring token, preview keys do not expire. An expiring token needs at least one hour left to issue a one-hour preview key. When 15 minutes or less remain, the direct OpenCode loopback proxy renews the key on use if the sandbox is still running and the token can issue another key. Gitterm-hosted routes don't renew automatically: run `sandbox_preview` again to refresh access.
 

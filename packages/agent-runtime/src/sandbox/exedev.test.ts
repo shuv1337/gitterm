@@ -1,4 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as realDelay } from "node:timers/promises";
 import { createExeDevSandboxTransport } from "./exedev";
 
 const id = "gitterm-sbx-0123456789-01234567";
@@ -6,7 +11,10 @@ const transport = createExeDevSandboxTransport({ apiKey: "test-token" });
 const ndjson = (...frames: object[]) =>
   new Response(frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
 
-function mockExec(handle: (command: string, headers: Headers) => Response) {
+function mockExec(
+  handle: (command: string, headers: Headers, signal?: AbortSignal) => Response | Promise<Response>,
+  status?: () => Response | undefined,
+) {
   const fetchMock: typeof fetch = Object.assign(
     async (url: RequestInfo | URL, init?: RequestInit) => {
       expect(url).toBe("https://exe.dev/exec");
@@ -14,9 +22,9 @@ function mockExec(handle: (command: string, headers: Headers) => Response) {
       const command = String(init?.body);
       const headers = new Headers(init?.headers);
       if (command === `ls ${id} --json`) {
-        return Response.json({ vms: [{ vm_name: id, status: "running" }] });
+        return status?.() ?? Response.json({ vms: [{ vm_name: id, status: "running" }] });
       }
-      return handle(command, headers);
+      return handle(command, headers, init?.signal ?? undefined);
     },
     { preconnect: fetch.preconnect },
   );
@@ -27,8 +35,14 @@ afterEach(() => {
   // Restore only the fetch spy; other test files can use their own module mocks.
   fetchSpy?.mockRestore();
   fetchSpy = undefined;
+  randomSpy?.mockRestore();
+  randomSpy = undefined;
+  if (tmp) rmSync(tmp, { recursive: true, force: true });
+  tmp = undefined;
 });
 let fetchSpy: ReturnType<typeof mockExec> | undefined;
+let randomSpy: ReturnType<typeof spyOn<typeof Math, "random">> | undefined;
+let tmp: string | undefined;
 
 test("exec survives both the lobby lexer and the VM shell, with the remote exit and streams", async () => {
   fetchSpy = mockExec((command, headers) => {
@@ -185,4 +199,505 @@ test("destroy discards the cached preview key", async () => {
   // Simulate a running VM with the same id. It must not get the destroyed VM's key.
   expect((await transport.preview(id, 3456)).headers).not.toEqual(first.headers);
   expect(minted).toBe(2);
+});
+
+const partAttempt = /\bt(\d+)\.(\d+)\b/;
+const upload = (clock?: Parameters<typeof createExeDevSandboxTransport>[1]) =>
+  createExeDevSandboxTransport({ apiKey: "test-token" }, clock);
+
+function localVm(
+  intercept?: (
+    command: string,
+    bash: (command: string) => Promise<Response>,
+    signal?: AbortSignal,
+  ) => Response | Promise<Response> | undefined,
+) {
+  const root = (tmp = mkdtempSync(join(tmpdir(), "gitterm-exedev-")));
+  randomSpy = spyOn(Math, "random").mockReturnValue(0);
+  const commands: string[] = [];
+  let jobs = 0;
+  const queue: Array<() => void> = [];
+  async function bash(command: string) {
+    if (jobs === 4) await new Promise<void>((resolve) => queue.push(resolve));
+    else jobs++;
+    try {
+      const child = Bun.spawn(
+        ["bash", "-c", `ssh() { [ "$#" = 2 ] || return 99; bash -c "$2"; }\n${command}`],
+        { cwd: root, env: { ...process.env, TMPDIR: root }, stdout: "pipe", stderr: "pipe" },
+      );
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).arrayBuffer(),
+        new Response(child.stderr).arrayBuffer(),
+        child.exited,
+      ]);
+      return ndjson(
+        { stdout: Buffer.from(stdout).toString("base64") },
+        { stderr: Buffer.from(stderr).toString("base64") },
+        { exit_code: exitCode },
+      );
+    } finally {
+      const next = queue.shift();
+      if (next) next();
+      else jobs--;
+    }
+  }
+  fetchSpy = mockExec((command, _headers, signal) => {
+    expect(command).toStartWith(`ssh ${id} `);
+    expect(Buffer.byteLength(command)).toBeLessThanOrEqual(64_000);
+    commands.push(command);
+    return intercept?.(command, bash, signal) ?? bash(command);
+  });
+  return { root, commands, busy: () => jobs > 0 };
+}
+
+function fakeClock() {
+  let now = Date.UTC(2026, 0, 1);
+  const timers = new Set<{ at: number; fire: () => void }>();
+  return {
+    now: () => now,
+    timer(ms: number, fire: () => void) {
+      const timer = { at: now + Math.max(1, ms), fire };
+      timers.add(timer);
+      return () => {
+        timers.delete(timer);
+      };
+    },
+    deadline(ms: number) {
+      const controller = new AbortController();
+      this.timer(ms, () => controller.abort(new DOMException("Timed out", "TimeoutError")));
+      return controller.signal;
+    },
+    async run<T>(operation: Promise<T>, busy = () => false) {
+      let settled = false;
+      const result = operation.finally(() => {
+        settled = true;
+      });
+      void result.catch(() => {});
+      while (!settled) {
+        if (busy()) {
+          await realDelay(1);
+          continue;
+        }
+        await realDelay(1);
+        if (settled || busy()) continue;
+        now = Math.min(...Array.from(timers, ({ at }) => at));
+        if (!Number.isFinite(now)) throw new Error("No timers left for an unfinished operation");
+        for (const timer of timers) {
+          if (timer.at > now) continue;
+          timers.delete(timer);
+          timer.fire();
+        }
+      }
+      return await result;
+    },
+  };
+}
+
+test("small and empty files each use one atomic write request", async () => {
+  let checked = false;
+  const { root, commands } = localVm((command, bash) => {
+    if (checked) return;
+    checked = true;
+    // Corrupt the payload without updating the expected hash, against a pre-existing file.
+    return bash(command.replace("bmV3", "b2xk"));
+  });
+  const path = join(root, "file");
+  writeFileSync(path, "original");
+  const sandbox = upload();
+  await expect(sandbox.writeFile(id, path, Buffer.from("new"))).rejects.toThrow("exit 9");
+  expect(readFileSync(path, "utf8")).toBe("original");
+  await sandbox.writeFile(id, path, Buffer.from("new"));
+  expect(readFileSync(path, "utf8")).toBe("new");
+  await sandbox.writeFile(id, path, Buffer.alloc(0));
+  expect(readFileSync(path)).toHaveLength(0);
+  expect(commands).toHaveLength(3);
+  expect(readdirSync(root)).toEqual(["file"]);
+});
+
+test("parallel parts fit the body limit and atomically assemble a hostile path", async () => {
+  let active = 0;
+  let peak = 0;
+  const { root, commands } = localVm(async (command, bash) => {
+    if (!partAttempt.test(command)) return bash(command);
+    expect(command).toContain("timeout -k 3 10 ");
+    peak = Math.max(peak, ++active);
+    try {
+      return await bash(command);
+    } finally {
+      active--;
+    }
+  });
+  const name = `é spaces ' " $(touch canary)`;
+  const path = join(root, name);
+  const data = randomBytes(500 * 1024);
+  const sandbox = upload();
+  await Promise.all([sandbox.writeFile(id, path, data), sandbox.writeFile(id, "second", data)]);
+  expect(readFileSync(path).equals(data)).toBe(true);
+  expect(readFileSync(join(root, "second")).equals(data)).toBe(true);
+  expect(readdirSync(root).toSorted()).toEqual(["second", name]);
+  expect(commands).toHaveLength(28);
+  expect(peak).toBeGreaterThan(1);
+  expect(peak).toBeLessThanOrEqual(8);
+});
+
+test.each(["504", "fetch throw", "missing exit", "error frame", "corrupt part", "124", "137"])(
+  "a part retries after %s and preserves file bytes",
+  async (failure) => {
+    const { root, commands } = localVm(async (command, bash) => {
+      if (!/\bt0\.0\b/.test(command)) return bash(command);
+      if (failure === "504") return new Response(null, { status: 504 });
+      if (failure === "fetch throw") throw new Error("connection closed");
+      if (failure === "error frame") return ndjson({ error: "VM did not report an exit status" });
+      if (failure === "corrupt part")
+        return bash(
+          command.replace(
+            /[A-Za-z0-9+/]{61440}/,
+            (payload) => `${payload[0] === "A" ? "B" : "A"}${payload.slice(1)}`,
+          ),
+        );
+      if (failure === "124" || failure === "137") return ndjson({ exit_code: Number(failure) });
+      // Lose the response after the remote write; replay must replace, not append.
+      await bash(command);
+      return ndjson({ stdout: "" });
+    });
+    const path = join(root, "file");
+    const data = randomBytes(100 * 1024);
+    await upload().writeFile(id, path, data);
+    expect(readFileSync(path).equals(data)).toBe(true);
+    expect(commands.filter((command) => /\bt0\.[01]\b/.test(command))).toHaveLength(2);
+    expect(readdirSync(root)).toEqual(["file"]);
+  },
+);
+
+test("a burst transitions to paced uploads under a sustained provider rate limit", async () => {
+  const clock = fakeClock();
+  let active = 0;
+  let burstPeak = 0;
+  let pacedPeak = 0;
+  let throttled = 0;
+  let first429: number | undefined;
+  let resumed: number | undefined;
+  let parts = 0;
+  const accepted: number[] = [];
+  const { root, busy } = localVm(async (command, bash) => {
+    if (!partAttempt.test(command)) return bash(command);
+    const now = clock.now();
+    if (first429 !== undefined) {
+      resumed ??= now;
+      pacedPeak = Math.max(pacedPeak, ++active);
+    } else burstPeak = Math.max(burstPeak, ++active);
+    const limited = ++parts > 7;
+    while (accepted.length && now - accepted[0]! >= 1000) accepted.shift();
+    const rejected = limited && accepted.length >= 6;
+    if (limited && !rejected) accepted.push(now);
+    try {
+      await new Promise<void>((resolve) => clock.timer(180, resolve));
+      if (rejected) {
+        first429 ??= clock.now();
+        throttled++;
+        return new Response(null, { status: 429, headers: { "retry-after": "1" } });
+      }
+      return await bash(command);
+    } finally {
+      active--;
+    }
+  });
+  const data = randomBytes(30 * 45 * 1024);
+  const path = join(root, "file");
+  await clock.run(upload(clock).writeFile(id, path, data), busy);
+  expect(readFileSync(path).equals(data)).toBe(true);
+  expect(throttled).toBeGreaterThan(0);
+  expect(resumed! - first429!).toBeGreaterThanOrEqual(1_000);
+  expect(burstPeak).toBe(8);
+  expect(pacedPeak).toBeGreaterThan(0);
+  expect(pacedPeak).toBeLessThanOrEqual(3);
+});
+
+test("200 refusals do not spend part attempts or the upload retry budget", async () => {
+  const clock = fakeClock();
+  const times = new Map<string, number>();
+  const attemptsUsed = new Set<string>();
+  let refused = 0;
+  const { root, busy } = localVm((command, bash) => {
+    const match = partAttempt.exec(command);
+    if (!match) return bash(command);
+    attemptsUsed.add(match[2]!);
+    const attempts = (times.get(match[1]!) ?? 0) + 1;
+    times.set(match[1]!, attempts);
+    if (attempts > 5) return bash(command);
+    refused++;
+    return new Response(null, { status: 429, headers: { "retry-after": "0" } });
+  });
+  const path = join(root, "file");
+  const data = randomBytes(40 * 45 * 1024);
+  await clock.run(upload(clock).writeFile(id, path, data), busy);
+  expect(refused).toBe(200);
+  expect([...attemptsUsed]).toEqual(["0"]);
+  expect(readFileSync(path).equals(data)).toBe(true);
+  expect(readdirSync(root)).toEqual(["file"]);
+});
+
+test("widespread 504 exhausts the shared retry budget even when retries succeed", async () => {
+  const attempts: string[] = [];
+  const { root } = localVm((command, bash) => {
+    const match = partAttempt.exec(command);
+    if (!match) return bash(command);
+    attempts.push(match[2]!);
+    return match[2] === "0" ? new Response(null, { status: 504 }) : bash(command);
+  });
+  await expect(
+    upload().writeFile(id, join(root, "file"), randomBytes(900 * 1024)),
+  ).rejects.toMatchObject({
+    code: "timeout",
+  });
+  expect(attempts.filter((attempt) => attempt === "0").length).toBeGreaterThanOrEqual(9);
+  expect(attempts.filter((attempt) => attempt !== "0").length).toBeLessThanOrEqual(8);
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("persistent 504 stops a part after four attempts and cleans up", async () => {
+  let failed = 0;
+  const { root } = localVm((command, bash) => {
+    if (!/\bt0\.\d+\b/.test(command)) return bash(command);
+    failed++;
+    return new Response(null, { status: 504 });
+  });
+  await expect(
+    upload().writeFile(id, join(root, "file"), randomBytes(100 * 1024)),
+  ).rejects.toMatchObject({
+    code: "timeout",
+  });
+  expect(failed).toBe(4);
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("an upload deadline stops persistent 429s, reports progress, and cleans up", async () => {
+  const clock = fakeClock();
+  let refused = 0;
+  const { root, commands, busy } = localVm((command, bash) => {
+    const match = partAttempt.exec(command);
+    if (!match || match[1] === "0") return bash(command);
+    refused++;
+    return new Response(null, { status: 429 });
+  });
+  const path = join(root, "file");
+  writeFileSync(path, "original");
+  await expect(
+    clock.run(upload(clock).writeFile(id, path, randomBytes(100 * 1024)), busy),
+  ).rejects.toMatchObject({
+    code: "timeout",
+    message: expect.stringContaining("46080/102400 bytes uploaded"),
+  });
+  expect(refused).toBeGreaterThan(8);
+  expect(commands.at(-1)).toContain("rm -rf");
+  expect(readFileSync(path, "utf8")).toBe("original");
+  expect(readdirSync(root)).toEqual(["file"]);
+});
+
+test("429s on status checks and rm use the shared cooldown and retry", async () => {
+  const clock = fakeClock();
+  let statuses = 0;
+  let removes = 0;
+  let resumeAt = 0;
+  fetchSpy = mockExec(
+    (command) => {
+      expect(command).toBe(`rm ${id}`);
+      if (++removes === 1) {
+        resumeAt = Math.floor(clock.now() / 1_000) * 1_000 + 2_000;
+        return new Response(null, {
+          status: 429,
+          headers: { "retry-after": new Date(resumeAt).toUTCString() },
+        });
+      }
+      expect(clock.now()).toBeGreaterThanOrEqual(resumeAt);
+      return Response.json({});
+    },
+    () => {
+      if (++statuses === 1) return new Response(null, { status: 429 });
+      return undefined;
+    },
+  );
+  randomSpy = spyOn(Math, "random").mockReturnValue(0);
+  await clock.run(upload(clock).destroy(id));
+  expect(statuses).toBe(2);
+  expect(removes).toBe(2);
+});
+
+test("a fatal 403 aborts outstanding parts before cleanup and does not start more", async () => {
+  let aborted = 0;
+  let started = 0;
+  const { root, commands } = localVm((command, bash, signal) => {
+    if (!partAttempt.test(command)) return bash(command);
+    started++;
+    if (/\bt0\.0\b/.test(command)) return new Response(null, { status: 403 });
+    return new Promise((_, reject) => {
+      const abort = () => {
+        aborted++;
+        reject(signal?.reason);
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
+  });
+  await expect(
+    upload().writeFile(id, join(root, "file"), randomBytes(900 * 1024)),
+  ).rejects.toMatchObject({
+    code: "auth",
+  });
+  expect(started).toBe(8);
+  expect(aborted).toBe(7);
+  expect(commands.at(-1)).toContain("rm -rf");
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("tampering before assembly leaves the pre-existing target unchanged", async () => {
+  const { root } = localVm((command, bash) => {
+    if (command.includes("xargs -0 cat")) {
+      const dir = readdirSync(root).find((name) => name.includes(".gitterm-parts-"))!;
+      const path = join(root, dir, "p000001");
+      const bytes = readFileSync(path);
+      bytes[0] = bytes[0]! ^ 1;
+      writeFileSync(path, bytes);
+    }
+    return bash(command);
+  });
+  const path = join(root, "file");
+  writeFileSync(path, "original");
+  await expect(upload().writeFile(id, path, randomBytes(100 * 1024))).rejects.toThrow("exit 9");
+  expect(readFileSync(path, "utf8")).toBe("original");
+  expect(readdirSync(root)).toEqual(["file"]);
+});
+
+test("a fast long-timeout command returns both streams and exit in its launch request", async () => {
+  const { root, commands } = localVm();
+  const cwd = join(root, `dir ' " é`);
+  mkdirSync(cwd);
+  const value = `$HOME " ' é\nline`;
+  const result = await upload().run(
+    id,
+    `sleep 1; printf '%s\\n' "$PWD" "$VALUE"; echo error >&2; exit 7`,
+    {
+      cwd,
+      env: { VALUE: value },
+      timeoutMs: 120_000,
+    },
+  );
+  expect(result).toEqual({ exitCode: 7, stdout: `${cwd}\n${value}\n`, stderr: "error\n" });
+  expect(commands).toHaveLength(1);
+  expect(commands[0]).toContain("timeout -k 3 25 ");
+  expect(readdirSync(root)).toEqual([`dir ' " é`]);
+});
+
+test("a lost detached command is a provider failure, not an exit status", async () => {
+  let polls = 0;
+  const { commands } = localVm((command, bash) => {
+    if (command.includes("setsid nohup"))
+      return ndjson({ stdout: "cnVubmluZwo=" }, { exit_code: 0 });
+    if (command.includes("echo lost")) {
+      if (++polls === 1) return new Response(null, { status: 504 });
+      return ndjson({ stdout: "bG9zdAo=" }, { exit_code: 0 });
+    }
+    return bash(command);
+  });
+  await expect(upload().run(id, "true", { timeoutMs: 120_000 })).rejects.toMatchObject({
+    code: "provider",
+    message: expect.stringContaining("lost"),
+  });
+  expect(polls).toBe(2);
+  expect(commands.at(-1)).toContain("rm -rf");
+});
+
+test("a completed poll can be replayed when its response is lost", async () => {
+  let polls = 0;
+  const { root, commands } = localVm(async (command, bash) => {
+    if (command.includes("setsid nohup"))
+      return bash(command.replace("SECONDS + 20", "SECONDS + 1"));
+    if (command.includes("echo lost") && ++polls === 1) {
+      await bash(command);
+      throw new Error("connection closed");
+    }
+    return bash(command);
+  });
+  expect(await upload().run(id, "sleep 2; echo ok", { timeoutMs: 60_000 })).toEqual({
+    exitCode: 0,
+    stdout: "ok\n",
+    stderr: "",
+  });
+  expect(polls).toBe(2);
+  expect(commands).toHaveLength(4);
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("a detached poll waits out a 429 and collects the result", async () => {
+  const clock = fakeClock();
+  let polls = 0;
+  let retryAt = 0;
+  const { busy, commands } = localVm((command, bash) => {
+    if (command.includes("setsid nohup"))
+      return ndjson({ stdout: "cnVubmluZwo=" }, { exit_code: 0 });
+    if (!command.includes("echo lost")) return bash(command);
+    if (++polls === 1) {
+      retryAt = clock.now() + 1_000;
+      return new Response(null, { status: 429, headers: { "retry-after": "1" } });
+    }
+    expect(clock.now()).toBeGreaterThanOrEqual(retryAt);
+    return ndjson(
+      {
+        stdout: Buffer.from("done\n0\n3\nb2sK\n0\n\n").toString("base64"),
+      },
+      { exit_code: 0 },
+    );
+  });
+  expect(await clock.run(upload(clock).run(id, "echo ok", { timeoutMs: 60_000 }), busy)).toEqual({
+    exitCode: 0,
+    stdout: "ok\n",
+    stderr: "",
+  });
+  expect(polls).toBe(2);
+  expect(commands.at(-1)).toContain("rm -rf");
+});
+
+test("a detached launch retries a 429 but never replays an uncertain 5xx", async () => {
+  const clock = fakeClock();
+  let launches = 0;
+  const { busy, commands } = localVm((command, bash) => {
+    if (!command.includes("setsid nohup")) return bash(command);
+    return new Response(null, { status: ++launches === 1 ? 429 : 504 });
+  });
+  await expect(
+    clock.run(upload(clock).run(id, "true", { timeoutMs: 60_000 }), busy),
+  ).rejects.toMatchObject({ code: "timeout" });
+  expect(launches).toBe(2);
+  expect(commands.at(-1)).toContain("rm -rf");
+});
+
+test("detached exit 124 is returned and large output keeps a marked tail", async () => {
+  const { root } = localVm();
+  const result = await upload().run(id, "head -c 1048576 /dev/zero; printf tail; exit 124", {
+    timeoutMs: 120_000,
+  });
+  expect(result.exitCode).toBe(124);
+  expect(result.stdout).toStartWith("[truncated to the last 1 MiB]\n");
+  expect(result.stdout).toEndWith("tail");
+  expect(result.stdout.split("\n")[1]).toHaveLength(1024 * 1024);
+  expect(readdirSync(root)).toEqual([]);
+});
+
+test("a 30-second timeout still uses one unchanged short command request", async () => {
+  const { commands } = localVm();
+  expect(await upload().run(id, "true", { timeoutMs: 30_000 })).toEqual({
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+  });
+  expect(commands).toEqual([`ssh ${id} 'timeout -k 3 25 bash -c '"'"'true'"'"''`]);
+});
+
+test("oversized commands are rejected by byte count before calling exec", async () => {
+  const { commands } = localVm();
+  await expect(upload().run(id, "é".repeat(32_000))).rejects.toThrow("exceeds 64000 bytes");
+  await expect(upload().run(id, "x".repeat(50_000), { timeoutMs: 120_000 })).rejects.toThrow(
+    "exceeds 64000 bytes",
+  );
+  expect(commands).toEqual([]);
 });
