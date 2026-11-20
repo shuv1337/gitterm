@@ -1,4 +1,6 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { posix } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   accountHash,
   classifyFailure,
@@ -10,6 +12,7 @@ import {
   terminated,
   validateLifetime,
   validatePort,
+  type SandboxFailureCode,
   type SandboxProviderInfo,
   type SandboxTransport,
 } from "./types";
@@ -17,39 +20,248 @@ import {
 const profile = SANDBOX_PROVIDER_PROFILES.exedev;
 export const DEFAULT_EXEDEV_SANDBOX_IMAGE = "node:22-bookworm";
 const NAME_PREFIX = "gitterm-sbx-";
-/** exe.dev's exec API accepts 64 KB request bodies; base64 chunks stay well below it. */
-const WRITE_CHUNK_BYTES = 40 * 1024;
+const MAX_EXEC_BODY_BYTES = 64_000;
+const PART_BYTES = 45 * 1024;
+const UPLOAD_CONCURRENCY = 8;
+const REQUEST_DEADLINE_MS = 120_000;
+const CLEANUP_DEADLINE_MS = 10_000;
+const DETACHED_OUTPUT_BYTES = 1024 * 1024;
+const BOOT_ID = "/proc/sys/kernel/random/boot_id";
 const READ_CHUNK_BYTES = 4 * 1024 * 1024;
 
 type VmList = { vms?: Array<{ vm_name: string; status?: string }> };
+const execClock = {
+  now: () => Date.now(),
+  timer(ms: number, fire: () => void) {
+    const handle = setTimeout(fire, ms);
+    return () => clearTimeout(handle);
+  },
+  deadline: (ms: number) => AbortSignal.timeout(ms),
+};
+
+class ExecFailure extends SandboxProviderError {
+  constructor(
+    code: SandboxFailureCode,
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(code, message);
+  }
+}
+
+const sha256 = (data: Uint8Array) => createHash("sha256").update(data).digest("hex");
+const base64 = (data: Uint8Array) =>
+  Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64");
+const backoff = (attempt: number) => Math.random() * (1_000 * 2 ** attempt);
+
+function checkExecBody(command: string) {
+  if (Buffer.byteLength(command) > MAX_EXEC_BODY_BYTES)
+    throw new SandboxProviderError(
+      "provider",
+      `exe.dev command exceeds ${MAX_EXEC_BODY_BYTES} bytes.`,
+    );
+}
+
+function parseRetryAfter(value: string | null, now: number) {
+  const header = value?.trim() ?? "";
+  const ms = /^\d+$/.test(header) ? Number(header) * 1_000 : Date.parse(header) - now;
+  return Number.isFinite(ms) ? Math.min(60_000, Math.max(0, ms)) : undefined;
+}
+
+function checkUpload(result: { exitCode: number; stderr: string }) {
+  if (result.exitCode === 0) return;
+  if (result.exitCode === 10 || result.stderr.includes("No space left"))
+    throw new SandboxProviderError("provider", "Not enough disk in the sandbox for the upload.");
+  if (result.exitCode === 8)
+    throw new SandboxProviderError("provider", "The upload directory is missing in the VM.");
+  const tail = result.stderr.trim().slice(-400);
+  throw new ExecFailure(
+    [124, 137].includes(result.exitCode) ? "timeout" : "provider",
+    `Could not upload the file to the VM (exit ${result.exitCode})${tail ? `: ${tail}` : "."}`,
+    [9, 124, 137].includes(result.exitCode),
+  );
+}
+
+function execLimiter(clock: typeof execClock) {
+  let rate = 0;
+  let activeParts = 0;
+  let latency = 60;
+  let successes = 0;
+  let generation = 0;
+  let refusals = 0;
+  let cooldown = 0;
+  let nextRequest = 0;
+  let priorityWaiters = 0;
+  const waiters = new Set<() => void>();
+  const tokenAt = () => Math.max(cooldown, nextRequest);
+  return {
+    async acquire(part: boolean, signal: AbortSignal) {
+      if (!part) priorityWaiters++;
+      try {
+        for (;;) {
+          signal.throwIfAborted();
+          const now = clock.now();
+          const wait = tokenAt() - now;
+          const limit = rate
+            ? Math.min(UPLOAD_CONCURRENCY, Math.ceil((rate * latency) / 1000) + 1)
+            : UPLOAD_CONCURRENCY;
+          if (wait <= 0 && (!part || (priorityWaiters === 0 && activeParts < limit))) {
+            // One token at a time after a 429; time spent idle never saves up another burst.
+            if (rate) nextRequest = now + 1_000 / rate;
+            if (part) activeParts++;
+            return { generation, startedAt: now };
+          }
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              cancel?.();
+              signal.removeEventListener("abort", wake);
+              waiters.delete(wake);
+              resolve();
+            };
+            const cancel = wait > 0 ? clock.timer(Math.ceil(wait), wake) : undefined;
+            waiters.add(wake);
+            signal.addEventListener("abort", wake, { once: true });
+          });
+        }
+      } finally {
+        if (!part && --priorityWaiters === 0) for (const wake of waiters) wake();
+      }
+    },
+    release(part: boolean) {
+      if (part) {
+        activeParts--;
+        for (const wake of waiters) wake();
+      }
+    },
+    succeeded(admission: { generation: number; startedAt: number }, part: boolean) {
+      if (admission.generation !== generation) return;
+      if (part) latency = latency * 0.9 + (clock.now() - admission.startedAt) * 0.1;
+      refusals = 0;
+      if (rate && ++successes === 50) {
+        rate = Math.min(20, rate + 1);
+        successes = 0;
+      }
+    },
+    failed(admission: { generation: number }) {
+      if (admission.generation === generation) successes = 0;
+    },
+    refused(admission: { generation: number }, retryAfter: number | undefined) {
+      const now = clock.now();
+      if (admission.generation === generation) {
+        generation++;
+        successes = 0;
+        rate = rate ? Math.max(2, rate / 2) : 8;
+        const cap = 500 * 2 ** Math.min(refusals++, 4);
+        retryAfter ??= cap * (0.5 + Math.random() / 2);
+        nextRequest = Math.max(nextRequest, now + 1_000 / rate);
+      }
+      if (retryAfter !== undefined) cooldown = Math.max(cooldown, now + retryAfter);
+    },
+  };
+}
+
+// The lobby lexes the request first, then the VM shell parses its single command argument.
+function sshBody(id: string, command: string, seconds: number) {
+  const remote = `timeout -k 3 ${seconds} bash -c ${shellQuote(command)}`;
+  return `ssh ${id} ${shellQuote(remote)}`;
+}
+
+function uploadPart(
+  dir: string,
+  index: number,
+  attempt: number,
+  width: number,
+  hash: string,
+  content: string,
+) {
+  const temp = `t${index}.${attempt}`;
+  const name = `p${String(index).padStart(width, "0")}`;
+  return `cd -- ${dir} || exit 8
+          trap 'rm -f -- ${temp}' EXIT
+          printf '%s' '${content}' | base64 -d > ${temp} || exit 1
+          [ "$(sha256sum < ${temp} | cut -d' ' -f1)" = ${hash} ] || exit 9
+          mv -fT -- ${temp} ${name}`;
+}
+
+function payloadCapacity(id: string, command: string, seconds: number) {
+  return Math.min(
+    PART_BYTES,
+    3 * Math.floor((MAX_EXEC_BODY_BYTES - Buffer.byteLength(sshBody(id, command, seconds))) / 4),
+  );
+}
 
 /**
  * An exe.dev VM from a plain image (the default `exeuntu` image ships coding agents).
  * exe.dev has no lifetime or auto-delete, so a VM runs until destroyed. The exec API
  * allows 30 s and 64 KB per request: jobs launch detached and uploads are chunked.
  */
-export function createExeDevSandboxTransport(config: {
-  apiKey: string;
-  image?: string;
-  /** Used when no machine profile is given, as exe.dev's `new` flags take them. */
-  cpu?: number;
-  memory?: string;
-  disk?: string;
-}): SandboxTransport {
+export function createExeDevSandboxTransport(
+  config: {
+    apiKey: string;
+    image?: string;
+    /** Used when no machine profile is given, as exe.dev's `new` flags take them. */
+    cpu?: number;
+    memory?: string;
+    disk?: string;
+  },
+  clock = execClock,
+): SandboxTransport {
   if (!config.apiKey?.trim()) throw new SandboxProviderError("auth", "exe.dev token is empty.");
   const accessKeys = new Map<string, { token: string; expiresAt?: number }>();
+  const limiter = execLimiter(clock);
 
-  async function request(command: string, action: string, accept = "text/plain") {
-    try {
-      const response = await fetch("https://exe.dev/exec", {
-        method: "POST",
-        headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "text/plain", accept },
-        body: command,
-        signal: AbortSignal.timeout(45_000),
-      });
-      return { status: response.status, ok: response.ok, text: await response.text() };
-    } catch (error) {
-      throw classifyFailure("exe.dev", error, action);
+  async function request(
+    command: string,
+    action: string,
+    accept = "text/plain",
+    timeoutSeconds = 25,
+    admissionSignal = clock.deadline(REQUEST_DEADLINE_MS),
+    part = false,
+    onAdmission?: () => AbortSignal,
+  ) {
+    checkExecBody(command);
+    for (;;) {
+      let admission: Awaited<ReturnType<typeof limiter.acquire>> | undefined;
+      let signal = admissionSignal;
+      try {
+        admission = await limiter.acquire(part, admissionSignal);
+        admissionSignal.throwIfAborted();
+        signal = onAdmission?.() ?? admissionSignal;
+        signal.throwIfAborted();
+        const timeout = clock.deadline((timeoutSeconds + 20) * 1000);
+        const response = await fetch("https://exe.dev/exec", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${config.apiKey}`,
+            "content-type": "text/plain",
+            accept,
+          },
+          body: command,
+          signal: AbortSignal.any([signal, timeout]),
+        });
+        // A 429 refused the command before execution. Only this layer replays it.
+        if (response.status === 429) {
+          limiter.refused(
+            admission,
+            parseRetryAfter(response.headers.get("retry-after"), clock.now()),
+          );
+          void response.body?.cancel().catch(() => {});
+          continue;
+        }
+        const text = await response.text();
+        signal.throwIfAborted();
+        if (response.ok) limiter.succeeded(admission, part);
+        else limiter.failed(admission);
+        return { status: response.status, ok: response.ok, text };
+      } catch (error) {
+        if (signal.aborted)
+          throw new SandboxProviderError("timeout", `exe.dev timed out while trying to ${action}.`);
+        if (admission) limiter.failed(admission);
+        const failure = classifyFailure("exe.dev", error, action);
+        throw new ExecFailure(failure.code, failure.message, true);
+      } finally {
+        if (admission) limiter.release(part);
+      }
     }
   }
 
@@ -59,14 +271,22 @@ export function createExeDevSandboxTransport(config: {
         "auth",
         `exe.dev rejected the token while trying to ${action}. Sandbox tokens need cmds new, ls, ssh, pause, resume, and rm. Private previews also need the exact subcommand "ssh-key generate-api-key".`,
       );
-    if (status === 504)
-      throw new SandboxProviderError("timeout", `exe.dev timed out while trying to ${action}.`);
-    if (!ok) throw classifyFailure("exe.dev", new Error(`${status} ${text.slice(0, 200)}`), action);
+    if (!ok) {
+      const failure =
+        status === 504
+          ? new SandboxProviderError("timeout", `exe.dev timed out while trying to ${action}.`)
+          : classifyFailure(
+              "exe.dev",
+              Object.assign(new Error(`${status} ${text.slice(0, 200)}`), { status }),
+              action,
+            );
+      throw new ExecFailure(failure.code, failure.message, status >= 500 && status < 600);
+    }
     return text;
   }
 
-  async function exec(command: string, action: string, accept?: string): Promise<string> {
-    return checked(await request(command, action, accept), action);
+  async function exec(command: string, action: string, signal?: AbortSignal): Promise<string> {
+    return checked(await request(command, action, undefined, undefined, signal), action);
   }
 
   async function mintPreviewKey(id: string) {
@@ -129,10 +349,10 @@ export function createExeDevSandboxTransport(config: {
     };
   };
 
-  async function info(id: string): Promise<SandboxProviderInfo> {
+  async function info(id: string, signal?: AbortSignal): Promise<SandboxProviderInfo> {
     if (!/^[a-z0-9-]+$/.test(id)) throw new Error("Invalid exe.dev VM name");
     try {
-      const vm = parseList(await exec(`ls ${id} --json`, "read the sandbox")).vms?.find(
+      const vm = parseList(await exec(`ls ${id} --json`, "read the sandbox", signal)).vms?.find(
         (item) => item.vm_name === id,
       );
       return vm ? infoFrom(id, vm.status) : terminated(id);
@@ -143,14 +363,27 @@ export function createExeDevSandboxTransport(config: {
     }
   }
 
-  async function ssh(id: string, command: string, timeoutMs = 25_000) {
-    // The lobby lexes the request first, then the VM shell parses the resulting command.
-    // Pass one lobby argument containing the entire VM command, with its own shell quoting.
-    const remote = `timeout -k 3 ${Math.max(1, Math.floor(timeoutMs / 1000))} bash -c ${shellQuote(command)}`;
-    const text = await exec(
-      `ssh ${id} ${shellQuote(remote)}`,
-      "run a command",
-      "application/x-ndjson",
+  async function ssh(
+    id: string,
+    command: string,
+    timeoutMs = 25_000,
+    signal?: AbortSignal,
+    part = false,
+    onAdmission?: () => AbortSignal,
+  ) {
+    const seconds = Math.max(1, Math.min(25, Math.floor(timeoutMs / 1000)));
+    const action = "run a command";
+    const text = checked(
+      await request(
+        sshBody(id, command, seconds),
+        action,
+        "application/x-ndjson",
+        seconds,
+        signal,
+        part,
+        onAdmission,
+      ),
+      action,
     );
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -161,12 +394,13 @@ export function createExeDevSandboxTransport(config: {
       try {
         frame = JSON.parse(line);
       } catch {
-        throw new SandboxProviderError("provider", "exe.dev returned invalid command output.");
+        throw new ExecFailure("provider", "exe.dev returned invalid command output.", true);
       }
       if (typeof frame?.error === "string")
-        throw new SandboxProviderError(
+        throw new ExecFailure(
           "provider",
           `exe.dev could not run the command: ${frame.error}`,
+          true,
         );
       if (typeof frame?.stdout === "string") stdout.push(Buffer.from(frame.stdout, "base64"));
       if (typeof frame?.stderr === "string") stderr.push(Buffer.from(frame.stderr, "base64"));
@@ -179,13 +413,205 @@ export function createExeDevSandboxTransport(config: {
         };
       }
     }
-    throw new SandboxProviderError("provider", "exe.dev did not report the command's exit code.");
+    throw new ExecFailure("provider", "exe.dev did not report the command's exit code.", true);
   }
 
-  async function running(id: string) {
-    const current = await info(id);
+  async function running(id: string, signal?: AbortSignal) {
+    const current = await info(id, signal);
     if (current.state !== "running")
       throw new SandboxProviderError("not_found", `The exe.dev VM is ${current.state}.`);
+  }
+
+  async function runDetached(
+    id: string,
+    command: string,
+    timeoutMs: number,
+    outerDeadline?: AbortSignal,
+  ) {
+    const dir = `D="\${TMPDIR:-/tmp}/gitterm-run-${randomBytes(8).toString("hex")}"`;
+    const bootMatches = `[ "$(cat "$D/boot" 2>/dev/null)" = "$(cat ${BOOT_ID})" ]`;
+    const readPid = `read -r pid wrapper < "$D/pid" && [[ "$pid" =~ ^[1-9][0-9]*$ && "$wrapper" =~ ^[1-9][0-9]*$ ]]`;
+    const wait = (remove: boolean) => `
+      end=$((SECONDS + 20))
+      touch -c -- "$D" 2>/dev/null || :
+      while ${bootMatches}; do
+        if [ -f "$D/exit" ]; then
+          printf 'done\\n%s\\n' "$(cat "$D/exit")"
+          for stream in out err; do
+            printf '%s\\n' "$(wc -c < "$D/$stream")"
+            tail -c ${DETACHED_OUTPUT_BYTES} -- "$D/$stream" | base64 -w0
+            printf '\\n'
+          done
+          ${remove ? 'rm -rf -- "$D"' : ":"}
+          exit 0
+        fi
+        if [ -f "$D/pid" ] && ! (${readPid} && kill -0 "$wrapper" 2>/dev/null); then
+          [ -f "$D/exit" ] && continue
+          break
+        fi
+        if [ "$SECONDS" -ge "$end" ]; then
+          if [ -f "$D/pid" ]; then echo running; else echo lost; fi
+          exit 0
+        fi
+        sleep 0.25
+      done
+      echo lost`;
+    const reap = (terminate: boolean) =>
+      ssh(
+        id,
+        `${dir}
+        ${
+          terminate
+            ? `if [ ! -f "$D/exit" ] && ${bootMatches} && [ -f "$D/pid" ] && ${readPid}; then
+                 if kill -TERM "$pid" 2>/dev/null; then
+                   end=$((SECONDS + 7))
+                   while [ ! -f "$D/exit" ] && kill -0 "$wrapper" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do
+                     sleep 0.1
+                   done
+                 fi
+              fi`
+            : ""
+        }
+        rm -rf -- "$D"`,
+        10_000,
+        clock.deadline(CLEANUP_DEADLINE_MS),
+      ).catch(() => {});
+    const detached = `timeout -k 5 ${Math.ceil(timeoutMs / 1000)} bash "$1/cmd" >"$1/out" 2>"$1/err" &
+      pid=$!
+      printf '%s %s\\n' "$pid" "$$" >"$1/pid.tmp" && mv -f -- "$1/pid.tmp" "$1/pid"
+      wait "$pid"
+      printf '%s\\n' "$?" >"$1/exit.tmp" && mv -f -- "$1/exit.tmp" "$1/exit"`;
+    const launch = `
+      set -e
+      ${dir}
+      find "\${TMPDIR:-/tmp}" -maxdepth 1 -regextype posix-extended -type d \\
+         -regex '.*/gitterm-run-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || :
+       (umask 077
+        mkdir -m 700 -- "$D"
+        printf '%s' '${Buffer.from(command).toString("base64")}' | base64 -d > "$D/cmd"
+        cat ${BOOT_ID} > "$D/boot"
+        touch -- "$D/out" "$D/err" "$D/pid.tmp" "$D/exit.tmp")
+       setsid nohup sh -c ${shellQuote(detached)} sh "$D" </dev/null >/dev/null 2>&1 &
+       ${wait(true)}`;
+    checkExecBody(sshBody(id, launch, 25));
+    const admissionDeadline = outerDeadline ?? clock.deadline(REQUEST_DEADLINE_MS);
+    let deadline = admissionDeadline;
+    try {
+      let result = await ssh(id, launch, 25_000, admissionDeadline, false, () => {
+        // A refused launch did not start a VM process. Start this budget at each admission.
+        const executionDeadline = clock.deadline(timeoutMs + 20_000);
+        deadline = outerDeadline
+          ? AbortSignal.any([outerDeadline, executionDeadline])
+          : executionDeadline;
+        return deadline;
+      });
+      let polled = false;
+      for (;;) {
+        deadline.throwIfAborted();
+        const [state, code, outSize, out, errSize, err] = result.stdout.split("\n");
+        if (result.exitCode === 0 && state === "done") {
+          if (
+            !/^\d+$/.test(code ?? "") ||
+            !/^\d+$/.test(outSize ?? "") ||
+            !/^\d+$/.test(errSize ?? "") ||
+            out === undefined ||
+            err === undefined
+          )
+            throw new SandboxProviderError("provider", "exe.dev returned invalid detached output.");
+          const output = (encoded: string, size: string) =>
+            (Number(size) > DETACHED_OUTPUT_BYTES ? "[truncated to the last 1 MiB]\n" : "") +
+            Buffer.from(encoded, "base64").toString();
+          // A poll never consumes the result: its response might be lost and need replaying.
+          if (polled) await reap(false);
+          return {
+            exitCode: Number(code),
+            stdout: output(out, outSize!),
+            stderr: output(err, errSize!),
+          };
+        }
+        if (result.exitCode === 0 && state === "lost")
+          throw new SandboxProviderError("provider", "exe.dev lost the detached command.");
+        if (result.exitCode !== 0 || state !== "running")
+          throw new SandboxProviderError(
+            "provider",
+            `exe.dev could not track the detached command (exit ${result.exitCode}): ${result.stderr.trim().slice(-400)}`,
+          );
+        for (let attempt = 0; ; attempt++) {
+          try {
+            result = await ssh(id, `${dir}\n${wait(false)}`, 25_000, deadline);
+            break;
+          } catch (error) {
+            if (!(error instanceof ExecFailure && error.retryable) || attempt === 3) throw error;
+            await delay(backoff(attempt), undefined, { signal: deadline });
+          }
+        }
+        polled = true;
+      }
+    } catch (error) {
+      await reap(true);
+      if (deadline.aborted)
+        throw new SandboxProviderError("timeout", "Timed out waiting for the exe.dev command.");
+      throw error;
+    }
+  }
+
+  async function uploadParts(
+    id: string,
+    dir: string,
+    data: Uint8Array,
+    partSize: number,
+    count: number,
+    deadline: AbortSignal,
+    uploaded: (bytes: number) => void,
+  ) {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, deadline]);
+    let next = 0;
+    let remainingRetries = Math.max(8, Math.floor(count * 0.02));
+    const width = Math.max(6, String(count - 1).length);
+    async function worker() {
+      while (next < count) {
+        const index = next++;
+        const part = data.subarray(index * partSize, (index + 1) * partSize);
+        const hash = sha256(part);
+        const content = base64(part);
+        for (let attempt = 0; ; attempt++) {
+          try {
+            checkUpload(
+              await ssh(
+                id,
+                uploadPart(dir, index, attempt, width, hash, content),
+                10_000,
+                signal,
+                true,
+              ),
+            );
+            uploaded(part.byteLength);
+            break;
+          } catch (error) {
+            signal.throwIfAborted();
+            if (
+              !(error instanceof ExecFailure && error.retryable) ||
+              attempt === 3 ||
+              remainingRetries === 0
+            ) {
+              controller.abort(error);
+              return;
+            }
+            remainingRetries--;
+            const pause = backoff(attempt);
+            if (pause) await delay(pause, undefined, { signal });
+          }
+        }
+      }
+    }
+    // The first failure owns cancellation; wait for every worker before removing staging files.
+    await Promise.all(
+      Array.from({ length: Math.min(count, UPLOAD_CONCURRENCY) }, () =>
+        worker().catch((error) => controller.abort(error)),
+      ),
+    );
+    signal.throwIfAborted();
   }
 
   return {
@@ -205,18 +631,18 @@ export function createExeDevSandboxTransport(config: {
         `new --name=${name} --no-email --image=${shellQuote(input.template ?? config.image ?? DEFAULT_EXEDEV_SANDBOX_IMAGE)}${size} --json`,
         "create a sandbox",
       );
+      const deadline = clock.deadline(REQUEST_DEADLINE_MS);
       try {
-        const deadline = Date.now() + 120_000;
-        while ((await info(name)).state !== "running") {
-          if (Date.now() > deadline)
-            throw new SandboxProviderError("timeout", "Timed out waiting for the exe.dev VM.");
-          await new Promise((resolve) => setTimeout(resolve, 1_000));
-        }
-        const check = await ssh(name, "true");
+        while ((await info(name, deadline)).state !== "running")
+          await delay(1_000, undefined, { signal: deadline });
+        const check = await ssh(name, "true", 25_000, deadline);
         if (check.exitCode !== 0) throw new Error("VM did not run a command");
-        return info(name);
+        return await info(name, deadline);
       } catch (error) {
-        return discardFailedCreate(() => exec(`rm ${name}`, "delete the sandbox"), name, error);
+        const failure = deadline.aborted
+          ? new SandboxProviderError("timeout", "Timed out waiting for the exe.dev VM.")
+          : error;
+        return discardFailedCreate(() => exec(`rm ${name}`, "delete the sandbox"), name, failure);
       }
     },
 
@@ -232,8 +658,9 @@ export function createExeDevSandboxTransport(config: {
 
     async destroy(id) {
       accessKeys.delete(id);
-      if ((await info(id)).state === "terminated") return;
-      await exec(`rm ${id}`, "delete the sandbox");
+      const deadline = clock.deadline(REQUEST_DEADLINE_MS);
+      if ((await info(id, deadline)).state === "terminated") return;
+      await exec(`rm ${id}`, "delete the sandbox", deadline);
     },
 
     async pause(id) {
@@ -245,7 +672,9 @@ export function createExeDevSandboxTransport(config: {
     },
 
     async run(id, command, options = {}) {
-      await running(id);
+      const vmTimeout = options.timeoutMs ?? 25_000;
+      const deadline = clock.deadline(REQUEST_DEADLINE_MS);
+      await running(id, deadline);
       const exports = Object.entries(options.env ?? {})
         .map(([key, value]) => {
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
@@ -254,23 +683,111 @@ export function createExeDevSandboxTransport(config: {
         })
         .join("");
       const cd = options.cwd ? `cd ${shellQuote(options.cwd)} && ` : "";
-      // The exec API allows 30 s per request; longer work belongs in jobs.
-      return ssh(id, `${exports}${cd}${command}`, Math.min(options.timeoutMs ?? 25_000, 25_000));
+      if (vmTimeout > 30_000) return runDetached(id, `${exports}${cd}${command}`, vmTimeout);
+      return ssh(id, `${exports}${cd}${command}`, vmTimeout, deadline);
     },
 
     async writeFile(id, path, data) {
-      await running(id);
-      const target = shellQuote(path);
-      const begin = await ssh(id, `mkdir -p "$(dirname ${target})" && : > ${target}`);
-      if (begin.exitCode !== 0)
-        throw new SandboxProviderError("provider", "Could not create the file in the VM.");
-      for (let offset = 0; offset < data.byteLength; offset += WRITE_CHUNK_BYTES) {
-        const chunk = Buffer.from(data.subarray(offset, offset + WRITE_CHUNK_BYTES)).toString(
-          "base64",
+      const deadline = clock.deadline(120_000 + Math.ceil((data.byteLength * 1000) / (64 * 1024)));
+      const file = path.startsWith("/") ? path : `./${path}`;
+      const target = shellQuote(file);
+      const parent = shellQuote(posix.dirname(file));
+      const nonce = randomBytes(8).toString("hex");
+      const temp = shellQuote(`${file}.gitterm-${nonce}.tmp`);
+      const verify = `[ "$(sha256sum < "$T" | cut -d' ' -f1)" = ${sha256(data)} ]`;
+      const stage = `T=${temp}; trap 'rm -f -- "$T"' EXIT`;
+      const dir = shellQuote(`${file}.gitterm-parts-${nonce}`);
+      const pathTooLong = () =>
+        new SandboxProviderError(
+          "provider",
+          `Upload path (${Buffer.byteLength(path)} bytes) is too long for the exe.dev request limit.`,
         );
-        const appended = await ssh(id, `printf %s ${chunk} | base64 -d >> ${target}`);
-        if (appended.exitCode !== 0)
-          throw new SandboxProviderError("provider", "Could not upload the file to the VM.");
+      const timedOut = (bytes: number) =>
+        new SandboxProviderError(
+          "timeout",
+          `exe.dev upload timed out (${bytes}/${data.byteLength} bytes uploaded).`,
+        );
+      const single = (content: string) => `
+          set -e
+          mkdir -p -- ${parent}
+          ${stage}
+          printf '%s' '${content}' | base64 -d > "$T"
+          ${verify} || exit 9
+          mv -fT -- "$T" ${target}`;
+      const singleCapacity = payloadCapacity(id, single(""), 25);
+      if (singleCapacity >= data.byteLength) {
+        let staged = false;
+        try {
+          await running(id, deadline);
+          staged = true;
+          checkUpload(await ssh(id, single(base64(data)), 25_000, deadline));
+        } catch (error) {
+          if (!deadline.aborted) throw error;
+          if (staged)
+            await ssh(id, `rm -f -- ${temp}`, 10_000, clock.deadline(CLEANUP_DEADLINE_MS)).catch(
+              () => {},
+            );
+          throw timedOut(0);
+        }
+        return;
+      }
+      const maxIndex = Math.floor(data.byteLength / 3);
+      const partSize = payloadCapacity(id, uploadPart(dir, maxIndex, 3, 6, "0".repeat(64), ""), 10);
+      if (partSize < 3) throw pathTooLong();
+      const count = Math.ceil(data.byteLength / partSize);
+      if (count === 0) throw pathTooLong();
+      const begin = `
+          set -eo pipefail
+          mkdir -p -- ${parent}
+          find ${parent} -maxdepth 1 -regextype posix-extended -type d \\
+            -regex '.*\\.gitterm-parts-[0-9a-f]{16}' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || :
+          space=$(df -Pk -- ${parent} | awk 'NR == 2 { print $4 }')
+          [[ "$space" =~ ^[0-9]+$ ]] || exit 1
+          [ "$space" -ge ${Math.ceil((2 * data.byteLength + 64 * 1024 * 1024) / 1024)} ] || exit 10
+          mkdir -m 700 -- ${dir}`;
+      const assemble = `
+          set -e
+          export LC_ALL=C
+          U=${dir}
+          ${stage}
+          (cd -- "$U" || exit 8
+            set -- p[0-9]*
+            [ "$#" -eq ${count} ] || exit 9
+            printf '%s\\0' "$@" | xargs -0 cat --) > "$T"
+          [ "$(wc -c < "$T")" -eq ${data.byteLength} ] && ${verify} || exit 9
+          mv -fT -- "$T" ${target}
+          rm -rf -- "$U"`;
+      if (
+        [begin, assemble].some(
+          (script) => Buffer.byteLength(sshBody(id, script, 25)) > MAX_EXEC_BODY_BYTES,
+        )
+      )
+        throw pathTooLong();
+      let staged = false;
+      let bytesDone = 0;
+      try {
+        await running(id, deadline);
+        staged = true;
+        checkUpload(await ssh(id, begin, 25_000, deadline));
+        await uploadParts(id, dir, data, partSize, count, deadline, (bytes) => {
+          bytesDone += bytes;
+        });
+        checkUpload(
+          data.byteLength > 256 * 1024 * 1024
+            ? await runDetached(id, assemble, 120_000, deadline)
+            : await ssh(id, assemble, 25_000, deadline),
+        );
+      } catch (error) {
+        const expired = deadline.aborted;
+        if (staged)
+          await ssh(
+            id,
+            `rm -rf -- ${dir} ${temp}`,
+            10_000,
+            clock.deadline(CLEANUP_DEADLINE_MS),
+          ).catch(() => {});
+        if (expired) throw timedOut(bytesDone);
+        throw error;
       }
     },
 
