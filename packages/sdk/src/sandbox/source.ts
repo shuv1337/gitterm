@@ -8,7 +8,7 @@ import { createTarGz, type TarEntry } from "./tar.js";
 /**
  * Source snapshots for sandbox builds: the working tree exactly as it is on disk
  * (committed, staged, unstaged, and non-ignored untracked files; deleted files absent),
- * without Git history or the conversation. Secret-looking files are excluded.
+ * without Git history or the conversation. Secret-looking files and submodules are excluded.
  */
 
 /** The synced checkout and Gitterm bookkeeping live below the sandbox user's home. */
@@ -115,15 +115,20 @@ export async function captureSource(
   }
   if ((await git(root, ["ls-files", "--unmerged", "-z"])).length)
     throw new Error("Resolve merge conflicts before syncing to a sandbox.");
-  const staged = (await git(root, ["ls-files", "--stage", "-z"])).toString().split("\0");
-  if (staged.some((line) => line.startsWith("160000 ")))
-    throw new Error("Submodules are not supported by sandbox sync yet.");
+  // Gitlinks are skipped without reading whatever is at their paths.
+  const gitlinks = new Set(
+    nulList(await git(root, ["ls-files", "--stage", "-z"]))
+      .filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
+  );
   const head = await git(root, ["rev-parse", "--verify", "-q", "HEAD"])
     .then((value) => value.toString().trim())
     .catch(() => null);
 
   const tracked = nulList(await git(root, ["ls-files", "-z", "--cached"]));
-  const deleted = new Set(nulList(await git(root, ["ls-files", "-z", "--deleted"])));
+  const deleted = new Set(
+    nulList(await git(root, ["ls-files", "-z", "--deleted"])).filter((file) => !gitlinks.has(file)),
+  );
   const modified = nulList(await git(root, ["ls-files", "-z", "--modified"])).filter(
     (file) => !deleted.has(file),
   );
@@ -139,6 +144,10 @@ export async function captureSource(
   const excluded: SourceSnapshot["excluded"] = [];
   let bytes = 0;
   for (const file of candidates) {
+    if (gitlinks.has(file)) {
+      excluded.push({ path: file, reason: "submodule (not synced)" });
+      continue;
+    }
     if (!safeRelativePath(file)) {
       excluded.push({ path: file, reason: "unsupported path" });
       continue;

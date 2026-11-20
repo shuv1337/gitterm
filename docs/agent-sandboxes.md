@@ -131,8 +131,9 @@ Excluded and reported:
 - secret-like names (`.env*` except examples, `.npmrc`, `.netrc`, `.pypirc`, keys, `*.pem`, `*.p12`, `*.pfx`, `*.key`, `credentials.json`)
 - files containing private-key blocks
 - paths matching the configured `exclude` globs
+- submodules (gitlinks)
 
-Submodules, unresolved merge conflicts, and sources over 100 MiB are rejected.
+Unresolved merge conflicts and sources over 100 MiB are rejected.
 
 The snapshot id is `snap_` plus the first 16 hex characters of a sha256 over the sorted
 manifest (`kind sha256 path` per file). The upload is a tar.gz built in process. In the
