@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -761,18 +761,28 @@ describe("source snapshots", () => {
       await writeFile(path.join(repo, "keep.txt"), "keep\n");
       git("add", "keep.txt");
       git("-c", "protocol.file.allow=always", "submodule", "add", "../child", "vendor/lib");
-      const orphaned = ["orphan/empty", "orphan/file", "orphan/missing"];
+      const orphaned = ["orphan/dir", "orphan/file", "orphan/link", "orphan/missing"];
       for (const file of orphaned)
         git("update-index", "--add", "--cacheinfo", `160000,${childSha},${file}`);
+      const dirSentinel = "orphan-dir-sentinel";
       const fileSentinel = "orphan-file-sentinel";
-      await mkdir(path.join(repo, "orphan/empty"), { recursive: true });
+      await mkdir(path.join(repo, "orphan/dir"), { recursive: true });
+      await writeFile(path.join(repo, "orphan/dir/inside.txt"), dirSentinel);
       await writeFile(path.join(repo, "orphan/file"), fileSentinel);
+      await symlink(child, path.join(repo, "orphan/link"), "dir");
       git("commit", "-qm", "init");
 
+      const submodule = path.join(repo, "vendor/lib");
       const childSentinel = "submodule-content-sentinel";
-      await writeFile(path.join(repo, "vendor/lib/new.txt"), childSentinel);
-      await writeFile(path.join(repo, "vendor/lib/.env"), `TOKEN=${childSentinel}`);
-      await writeFile(path.join(repo, "vendor/lib/tracked.txt"), `${childSentinel}\n`);
+      await writeFile(path.join(submodule, "new.txt"), childSentinel);
+      await writeFile(path.join(submodule, ".env"), `TOKEN=${childSentinel}`);
+      await writeFile(path.join(submodule, "tracked.txt"), `${childSentinel}\n`);
+      execFileSync(
+        "git",
+        ["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qam", "move"],
+        { cwd: submodule, stdio: "pipe" },
+      );
+      expect(git("ls-files", "--modified", "-z").toString().split("\0")).toContain("vendor/lib");
 
       const { snapshot, archive } = await captureSource(repo);
       expect(snapshot.files.map((file) => file.path)).toEqual([".gitmodules", "keep.txt"]);
@@ -787,6 +797,7 @@ describe("source snapshots", () => {
       );
       const tar = gunzipSync(archive);
       expect(tar.includes(childSentinel)).toBe(false);
+      expect(tar.includes(dirSentinel)).toBe(false);
       expect(tar.includes(fileSentinel)).toBe(false);
       expect((await captureSource(repo)).snapshot.digest).toBe(snapshot.digest);
     } finally {
